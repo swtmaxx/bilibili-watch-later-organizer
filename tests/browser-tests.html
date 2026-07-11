@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>B站稍后再看分类器浏览器测试</title>
+<script src="../src/shared.js"></script>
+<script src="../src/idb.js"></script>
+<body>
+  <h1>浏览器测试</h1>
+  <pre id="output">Running...</pre>
+  <script>
+    const output = document.getElementById("output");
+    const logs = [];
+    function ok(name, condition) {
+      if (!condition) throw new Error(name);
+      logs.push("PASS " + name);
+    }
+    (async () => {
+      const core = window.BiliWLCore;
+      const db = window.BiliWLDB;
+      const video = core.canonicalizeVideo({ bvid: "BV1xx411c7mD", title: "测试视频", upName: "UP" });
+      ok("canonicalizeVideo", video.sourceHash);
+      await db.openDB();
+      await db.upsertVideos([video]);
+      const summary = await db.summary();
+      ok("IndexedDB upsert", summary.videos.some((item) => item.bvid === "BV1xx411c7mD"));
+      logs.push("DONE");
+      output.textContent = logs.join("\n");
+    })().catch((error) => {
+      output.textContent = logs.concat("FAIL " + error.message).join("\n");
+    });
+  </script>
+</body>

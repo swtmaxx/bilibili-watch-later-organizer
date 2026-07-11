@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>首次引导视觉测试</title>
+  <link rel="stylesheet" href="../src/dashboard.css">
+</head>
+<body>
+  <div id="app"></div>
+  <script src="../src/shared.js"></script>
+  <script>
+    const core = window.BiliWLCore;
+    const mode = new URLSearchParams(location.search).get("mode") || "login";
+    let mockState = {
+      videos: [
+        core.canonicalizeVideo({ bvid: "BV1xx411c7mD", title: "ChatGPT 大模型工作流入门", upName: "科技UP", tname: "知识" }),
+        core.canonicalizeVideo({ bvid: "BV1yy411c7mE", title: "十分钟学会一道家常菜", upName: "美食UP", tname: "美食" })
+      ],
+      classifications: [],
+      categories: core.DEFAULT_CATEGORIES.map((item) => Object.assign({}, item)),
+      settings: Object.assign({}, core.DEFAULT_SETTINGS, {
+        onboardingVersion: 1,
+        onboardingEligible: true,
+        onboardingCompleted: false,
+        onboardingStage: mode === "login" ? "login" : mode === "guide" ? "guide" : "setup",
+        onboardingMethod: ""
+      }),
+      jobs: [],
+      progress: { status: "idle", message: "视觉测试", pending: 0, running: 0, done: 0, failed: 0 },
+      classifySummary: { total: 2, classified: 0, unclassified: 2, needsClassification: 2, sourceCounts: { manual: 0, llm: 0, keyword: 0 } }
+    };
+
+    window.chrome = {
+      runtime: {
+        onMessage: { addListener() {} },
+        async sendMessage(payload) {
+          if (payload.type === core.MESSAGE_TYPES.CHECK_BILI_LOGIN) {
+            return { ok: true, data: { loginStatus: mode === "login" ? "logged_out" : "logged_in" } };
+          }
+          if (payload.type === core.MESSAGE_TYPES.UPDATE_SETTINGS) {
+            mockState.settings = Object.assign({}, mockState.settings, payload.settings || {});
+          }
+          if (payload.type === core.MESSAGE_TYPES.EXPORT_CATEGORY_PROPOSAL) {
+            return { ok: true, data: { prompt: core.buildCategoryProposalPrompt(mockState.videos, mockState.categories), sampleCount: 2, totalVideos: 2 } };
+          }
+          if (payload.type === core.MESSAGE_TYPES.IMPORT_CATEGORIES) {
+            mockState.categories = (payload.payload.categories || []).map((category) => Object.assign({ enabled: true }, category));
+            return { ok: true, data: Object.assign({}, mockState, { categoryImportResult: { imported: mockState.categories.length } }) };
+          }
+          if (payload.type === core.MESSAGE_TYPES.SYNC_ON_OPEN) {
+            return {
+              ok: true,
+              data: Object.assign({}, mockState, {
+                openSyncResult: {
+                  scanResult: { scannedCount: mode === "login" ? 0 : 2, newCount: 0, changedCount: 0, removedCount: 0 },
+                  autoClassifyResult: { classified: 0, skipped: Boolean(payload.skipAutoClassify) },
+                  loginStatus: mode === "login" ? "logged_out" : "logged_in",
+                  apiCode: mode === "login" ? -101 : 0,
+                  apiError: mode === "login" ? "账号未登录" : ""
+                }
+              })
+            };
+          }
+          if (payload.type === core.MESSAGE_TYPES.FETCH_VIDEO_DETAILS) {
+            return { ok: true, data: Object.assign({}, mockState, { detailQueueResult: { candidates: 0, queued: 0, pending: 0 } }) };
+          }
+          return { ok: true, data: mockState };
+        }
+      }
+    };
+  </script>
+  <script src="../src/dashboard.js"></script>
+</body>
+</html>
