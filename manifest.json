@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "B站稍后再看整理助手",
-  "version": "1.0.0",
-  "description": "自动归类 B站稍后再看视频，支持 AI 批量分类和手动确认。",
+  "name": "__MSG_extensionName__",
+  "version": "1.1.0",
+  "description": "__MSG_extensionDescription__",
+  "default_locale": "zh_CN",
   "permissions": ["storage", "cookies", "tabs", "scripting"],
   "host_permissions": [
     "https://www.bilibili.com/*",
@@ -37,6 +38,6 @@
       "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
     },
-    "default_title": "打开稍后再看整理助手"
+    "default_title": "__MSG_extensionActionTitle__"
   }
 }

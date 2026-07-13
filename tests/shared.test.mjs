@@ -38,7 +38,7 @@ function loadBackgroundHelpers() {
 test("extension version is consistent across manifests", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(core.EXTENSION_VERSION, "1.0.0");
+  assert.equal(core.EXTENSION_VERSION, "1.1.0");
   assert.equal(manifest.version, core.EXTENSION_VERSION);
   assert.equal(pkg.version, core.EXTENSION_VERSION);
 });

@@ -1,7 +1,7 @@
 (function attachBiliWatchLaterCore(root) {
   "use strict";
 
-  const EXTENSION_VERSION = "1.0.0";
+  const EXTENSION_VERSION = "1.1.0";
   const CLASSIFIER_VERSION = "manual-llm-json-v1";
   const LOCAL_CLASSIFIER_VERSION = "local-rules-v1";
   const CLASSIFICATION_SOURCE_TYPES = Object.freeze({
