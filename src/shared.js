@@ -1,7 +1,7 @@
 (function attachBiliWatchLaterCore(root) {
   "use strict";
 
-  const EXTENSION_VERSION = "1.1.0";
+  const EXTENSION_VERSION = "1.1.3";
   const CLASSIFIER_VERSION = "manual-llm-json-v1";
   const LOCAL_CLASSIFIER_VERSION = "local-rules-v1";
   const CLASSIFICATION_SOURCE_TYPES = Object.freeze({
@@ -52,7 +52,12 @@
     llmLimit: 0,
     llmTemperature: 0.1,
     llmIncludeAll: false,
-    llmUseResponseFormat: false
+    llmUseResponseFormat: false,
+    llmAutoClassifyMode: "off",
+    llmAutoClassifyThreshold: 50,
+    llmAutoClassifyLastRunAt: 0,
+    llmAutoClassifyLastStatus: "",
+    llmAutoClassifyLastImported: 0
   });
 
   const DEFAULT_CATEGORIES = Object.freeze([
@@ -254,6 +259,22 @@
     merged.tags = pickUseful(uniqueStrings(input && input.tags), merged.tags) || [];
     merged.desc = pickUseful(normalizeText(input && input.desc), merged.desc);
     merged.duration = pickUseful(toNumberOrUndefined(input && input.duration), merged.duration);
+    merged.viewCount = pickUseful(toNumberOrUndefined(input && input.viewCount), merged.viewCount);
+    const incomingProgress = toNumberOrUndefined(input && input.watchProgress);
+    const incomingWatched = input && typeof input.isWatched === "boolean" ? input.isWatched : undefined;
+    if (incomingProgress != null) {
+      const watchedToEnd = incomingProgress < 0 || incomingWatched === true;
+      const normalizedProgress = watchedToEnd && Number(merged.duration) > 0
+        ? Number(merged.duration)
+        : Math.max(0, incomingProgress);
+      merged.watchProgress = Number(merged.duration) > 0
+        ? Math.min(normalizedProgress, Number(merged.duration))
+        : normalizedProgress;
+      merged.isWatched = watchedToEnd || (Number(merged.duration) > 0 && merged.watchProgress >= Number(merged.duration));
+    } else if (incomingWatched != null) {
+      merged.isWatched = incomingWatched;
+      if (incomingWatched && Number(merged.duration) > 0) merged.watchProgress = Number(merged.duration);
+    }
     merged.pubdate = pickUseful(toNumberOrUndefined(input && input.pubdate), merged.pubdate);
     merged.watchlaterAddedAt = pickUseful(toNumberOrUndefined(input && input.watchlaterAddedAt), merged.watchlaterAddedAt);
     merged.watchlaterOrder = pickUseful(toNumberOrUndefined(input && input.watchlaterOrder), merged.watchlaterOrder);

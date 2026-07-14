@@ -4,10 +4,14 @@ const core = globalThis.BiliWLCore;
 const db = globalThis.BiliWLDB;
 const CLASSIFICATION_REPAIR_VERSION = "0.2.4";
 const ONBOARDING_VERSION = 1;
+const AUTO_LLM_ALARM = "auto-llm-classify";
+const AUTO_LLM_CONTINUE_ALARM = "auto-llm-classify-continue";
+const AUTO_LLM_MAX_BATCHES_PER_WAKE = 2;
 
 let detailRunPromise = null;
 let classificationRepairPromise = null;
 let initializationPromise = null;
+let autoLlmRunPromise = null;
 let progress = {
   status: "idle",
   message: "等待扫描",
@@ -24,6 +28,20 @@ chrome.runtime.onInstalled.addListener((details) => {
     .finally(() => {
       initializationPromise = null;
     });
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  initializationPromise = initializeExtension({})
+    .catch((error) => console.warn("startup init failed", error))
+    .finally(() => {
+      initializationPromise = null;
+    });
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (!alarm || ![AUTO_LLM_ALARM, AUTO_LLM_CONTINUE_ALARM].includes(alarm.name)) return;
+  maybeRunAutoLlmClassification(alarm.name)
+    .catch((error) => console.warn("automatic AI classification failed", error));
 });
 
 chrome.action.onClicked.addListener(() => {
@@ -99,6 +117,8 @@ async function initializeExtension(details) {
   await ensureConfig();
   await initializeOnboarding(details || {});
   await ensureClassificationRepair();
+  const config = await getConfig();
+  await configureAutoLlmAlarm(config.settings, false);
 }
 
 async function initializeOnboarding(details) {
@@ -231,6 +251,12 @@ async function updateSettings(nextSettings) {
   if (Number.isFinite(Number(nextSettings.llmTemperature))) {
     settings.llmTemperature = Math.min(2, Math.max(0, Number(nextSettings.llmTemperature)));
   }
+  if (["off", "daily", "weekly", "threshold"].includes(nextSettings.llmAutoClassifyMode)) {
+    settings.llmAutoClassifyMode = nextSettings.llmAutoClassifyMode;
+  }
+  if (Number.isFinite(Number(nextSettings.llmAutoClassifyThreshold))) {
+    settings.llmAutoClassifyThreshold = Math.min(10000, Math.max(1, Math.floor(Number(nextSettings.llmAutoClassifyThreshold))));
+  }
   if (typeof nextSettings.detailFetchEnabled === "boolean") {
     settings.detailFetchEnabled = nextSettings.detailFetchEnabled;
   }
@@ -261,7 +287,212 @@ async function updateSettings(nextSettings) {
     }
   });
   await chromeStorageSet({ settings });
+  if (Object.prototype.hasOwnProperty.call(nextSettings, "llmAutoClassifyMode") || Object.prototype.hasOwnProperty.call(nextSettings, "llmAutoClassifyThreshold")) {
+    await configureAutoLlmAlarm(settings, true);
+  }
   return getState();
+}
+
+async function configureAutoLlmAlarm(settings, force) {
+  const mode = settings && settings.llmAutoClassifyMode;
+  const existing = await chrome.alarms.get(AUTO_LLM_ALARM);
+  if (!force && existing && mode !== "off") return;
+  await chrome.alarms.clear(AUTO_LLM_ALARM);
+  await chrome.alarms.clear(AUTO_LLM_CONTINUE_ALARM);
+  if (mode === "daily") {
+    chrome.alarms.create(AUTO_LLM_ALARM, { delayInMinutes: 24 * 60, periodInMinutes: 24 * 60 });
+  } else if (mode === "weekly") {
+    chrome.alarms.create(AUTO_LLM_ALARM, { delayInMinutes: 7 * 24 * 60, periodInMinutes: 7 * 24 * 60 });
+  } else if (mode === "threshold") {
+    chrome.alarms.create(AUTO_LLM_ALARM, { delayInMinutes: 1, periodInMinutes: 30 });
+  }
+}
+
+async function maybeRunAutoLlmClassification(triggerName) {
+  if (autoLlmRunPromise) return autoLlmRunPromise;
+  autoLlmRunPromise = runScheduledLlmClassification(triggerName)
+    .finally(() => {
+      autoLlmRunPromise = null;
+    });
+  return autoLlmRunPromise;
+}
+
+async function runScheduledLlmClassification(triggerName) {
+  const config = await getConfig();
+  const settings = config.settings || {};
+  const mode = settings.llmAutoClassifyMode || "off";
+  if (mode === "off") return { skipped: true, reason: "disabled" };
+  if (!apiConfigReady(settings)) {
+    await writeAutoLlmStatus({
+      llmAutoClassifyLastRunAt: Date.now(),
+      llmAutoClassifyLastStatus: "自动分类未运行：请先完成并测试 API 设置",
+      llmAutoClassifyLastImported: 0
+    });
+    return { skipped: true, reason: "api-not-configured" };
+  }
+
+  const summary = await db.summary();
+  const counts = core.classificationStageCounts(summary.videos, summary.classifications);
+  const threshold = Math.max(1, Number(settings.llmAutoClassifyThreshold) || 50);
+  if (triggerName !== AUTO_LLM_CONTINUE_ALARM && mode === "threshold" && counts.pending < threshold) {
+    await writeAutoLlmStatus({
+      llmAutoClassifyLastStatus: "等待待精细分类达到 " + threshold + " 个；当前 " + counts.pending + " 个"
+    });
+    return { skipped: true, reason: "below-threshold", pending: counts.pending };
+  }
+  if (!counts.pending) {
+    await writeAutoLlmStatus({ llmAutoClassifyLastStatus: "没有待精细分类的视频" });
+    return { skipped: true, reason: "no-pending" };
+  }
+
+  const startedAt = Date.now();
+  setProgress({ status: "running", message: "正在自动进行 API 视频分类", running: 1, pending: counts.pending, done: 0, failed: 0 });
+  try {
+    const result = await runAutomaticLlmBatches(settings);
+    await writeAutoLlmStatus({
+      llmAutoClassifyLastRunAt: startedAt,
+      llmAutoClassifyLastStatus: "自动分类完成：导入 " + result.imported + " 项，跳过 " + result.skipped + " 项" + (result.remaining ? "；剩余任务稍后继续" : ""),
+      llmAutoClassifyLastImported: result.imported
+    });
+    setProgress({ status: "idle", message: "自动 API 视频分类完成：导入 " + result.imported + " 项", running: 0, pending: result.remaining, done: result.imported, failed: 0 });
+    return result;
+  } catch (error) {
+    const errorMessage = error && error.message ? error.message : String(error);
+    await writeAutoLlmStatus({
+      llmAutoClassifyLastRunAt: startedAt,
+      llmAutoClassifyLastStatus: "自动分类失败：" + errorMessage,
+      llmAutoClassifyLastImported: 0
+    });
+    setProgress({ status: "error", message: "自动 API 视频分类失败：" + errorMessage, running: 0, failed: 1 });
+    throw error;
+  }
+}
+
+async function runAutomaticLlmBatches(settings) {
+  const batchSize = Math.min(100, Math.max(1, Number(settings.llmBatchSize) || 50));
+  let imported = 0;
+  let skipped = 0;
+  let batches = 0;
+  let remaining = 0;
+  while (batches < AUTO_LLM_MAX_BATCHES_PER_WAKE) {
+    const exported = await exportClassifyBatch({ includeAll: false, limit: batchSize, offset: 0 });
+    remaining = exported.totalCandidates || 0;
+    if (!exported.batchSize) break;
+    setProgress({ message: "正在自动分类第 " + (batches + 1) + " 批，共 " + exported.batchSize + " 个视频", pending: remaining, running: 1 });
+    const payload = await callAutomaticLlm(settings, exported.prompt || "");
+    const importedState = await importClassifications(JSON.stringify(payload), { mergeMode: "replace" });
+    const importResult = importedState.importResult || {};
+    imported += importResult.imported || 0;
+    skipped += importResult.skipped || 0;
+    batches += 1;
+    if (!(importResult.imported || 0)) break;
+  }
+  const latest = await db.summary();
+  remaining = core.classificationStageCounts(latest.videos, latest.classifications).pending;
+  if (remaining > 0 && batches >= AUTO_LLM_MAX_BATCHES_PER_WAKE) {
+    chrome.alarms.create(AUTO_LLM_CONTINUE_ALARM, { delayInMinutes: 1 });
+  }
+  return { imported, skipped, batches, remaining };
+}
+
+async function callAutomaticLlm(config, prompt) {
+  const requestPrompt = [
+    prompt,
+    "",
+    "重要：必须为本批待分类视频中的每一个 bvid 返回一项。不要漏掉视频；信息不足时用 other.todo。",
+    "返回必须是严格 JSON 对象：所有属性名和字符串都必须使用双引号，顶层必须是 {\"items\":[...]}。"
+  ].join("\n");
+  let response = await sendAutomaticLlmRequest(config, requestPrompt, config.llmUseResponseFormat === true);
+  let textValue = await response.text();
+  if (!response.ok && config.llmUseResponseFormat === true && /response[_ ]format|json_object/i.test(textValue)) {
+    response = await sendAutomaticLlmRequest(config, requestPrompt, false);
+    textValue = await response.text();
+  }
+  if (!response.ok) throw new Error("AI API HTTP " + response.status + ": " + textValue.slice(0, 300));
+  const data = parseAutomaticJson(textValue);
+  const content = data && data.choices && data.choices[0] && data.choices[0].message
+    ? data.choices[0].message.content
+    : "";
+  if (!content) throw new Error("AI 响应缺少 choices[0].message.content");
+  const parsed = parseAutomaticJson(content);
+  const items = Array.isArray(parsed && parsed.items)
+    ? parsed.items
+    : Array.isArray(parsed && parsed.classifications)
+      ? parsed.classifications
+      : [];
+  if (!items.length) throw new Error("AI 返回的 JSON 没有 items/classifications 数组");
+  return { items };
+}
+
+function sendAutomaticLlmRequest(config, requestPrompt, useResponseFormat) {
+  const body = {
+    model: config.llmModel,
+    temperature: Number(config.llmTemperature) || 0,
+    messages: [
+      { role: "system", content: "你只返回严格 JSON。不要 Markdown，不要解释。" },
+      { role: "user", content: requestPrompt }
+    ]
+  };
+  if (useResponseFormat) body.response_format = { type: "json_object" };
+  return fetchWithTimeout(chatCompletionsUrl(config.llmBaseUrl), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": "Bearer " + config.llmApiKey,
+      "x-title": "Bili Watchlater Classifier"
+    },
+    body: JSON.stringify(body)
+  }, 120000);
+}
+
+function parseAutomaticJson(value) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("JSON 内容为空");
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const unfenced = fenced ? fenced[1].trim() : raw;
+  const start = unfenced.indexOf("{");
+  const end = unfenced.lastIndexOf("}");
+  const candidate = start >= 0 && end > start ? unfenced.slice(start, end + 1) : unfenced;
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    const repaired = candidate
+      .replace(/^\uFEFF/, "")
+      .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)/g, "$1\"$2\"$3")
+      .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, content) => JSON.stringify(content.replace(/\\"/g, "\"")))
+      .replace(/,\s*([}\]])/g, "$1");
+    try {
+      return JSON.parse(repaired);
+    } catch (repairError) {
+      throw new Error("AI 返回的内容不是严格 JSON：" + repairError.message);
+    }
+  }
+}
+
+function apiConfigReady(settings) {
+  return Boolean(core.normalizeText(settings && settings.llmBaseUrl) && core.normalizeText(settings && settings.llmModel) && core.normalizeText(settings && settings.llmApiKey));
+}
+
+async function writeAutoLlmStatus(patch) {
+  const data = await chromeStorageGet(["settings"]);
+  const settings = Object.assign({}, core.DEFAULT_SETTINGS, data.settings || {}, patch || {});
+  await chromeStorageSet({ settings });
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, Object.assign({}, options || {}, { signal: controller.signal }));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function chatCompletionsUrl(value) {
+  const url = core.normalizeText(value).replace(/\/+$/g, "");
+  if (!url) return "";
+  return /\/chat\/completions$/i.test(url) ? url : url + "/chat/completions";
 }
 
 async function openDashboard() {
@@ -421,6 +652,7 @@ async function queueMissingVideoDetails() {
 
 function shouldFetchDetails(video) {
   if (!video) return false;
+  if (video.viewCount == null) return true;
   if (!video.tname || !video.desc || !Array.isArray(video.tags) || !video.tags.length) return true;
   return false;
 }
@@ -467,6 +699,9 @@ function convertBiliApiVideo(item, index) {
   const bvid = core.normalizeBvid(item && (item.bvid || item.bv_id || item.uri || item.redirect_url));
   if (!bvid) return null;
   const owner = item.owner || item.author || {};
+  const duration = Number(item.duration) || 0;
+  const rawProgress = Number(item.progress);
+  const hasProgress = Number.isFinite(rawProgress);
   return {
     bvid,
     oid: item.oid,
@@ -478,7 +713,10 @@ function convertBiliApiVideo(item, index) {
     coverUrl: item.pic || item.cover,
     tname: item.tname || item.typename || item.type_name,
     desc: item.desc,
-    duration: item.duration,
+    duration,
+    viewCount: item.stat && item.stat.view,
+    watchProgress: hasProgress ? rawProgress : undefined,
+    isWatched: hasProgress ? rawProgress < 0 || duration > 0 && rawProgress >= duration : undefined,
     pubdate: item.pubdate || item.pubtime || item.ctime,
     watchlaterAddedAt: item.add_at || item.addAt || item.add_time || item.addtime || item.view_at,
     watchlaterOrder: Number.isFinite(Number(index)) ? Number(index) : undefined,
@@ -714,6 +952,7 @@ async function fetchVideoDetails(bvid) {
     tags,
     desc: data.desc,
     duration: data.duration,
+    viewCount: data.stat && data.stat.view,
     pubdate: data.pubdate || data.ctime,
     pageParts: Array.isArray(data.pages) ? data.pages.map((page) => page.part).filter(Boolean) : [],
     presentInWatchlater: true
@@ -759,6 +998,7 @@ async function fetchVideoDetailsFromHtml(bvid) {
     tname: videoData && videoData.tname,
     coverUrl: videoData && videoData.pic,
     duration: videoData && videoData.duration,
+    viewCount: videoData && videoData.stat && videoData.stat.view,
     pubdate: videoData && (videoData.pubdate || videoData.ctime),
     presentInWatchlater: true
   };
@@ -1307,7 +1547,7 @@ async function reorderCategory(message) {
   const target = categories.find((item) => item.id === targetId && item.enabled !== false);
   if (!category || !target) throw new Error("分类不存在");
   if ((category.parentId || "") !== (target.parentId || "")) {
-    throw new Error("只能在同一级分类内拖动排序；改变等级请用手动编辑分类目录");
+    throw new Error("只能在同一级分类内拖动排序；改变等级请用编辑分类目录");
   }
 
   const parentId = category.parentId || "";
@@ -1315,13 +1555,14 @@ async function reorderCategory(message) {
     .filter((item) => item.enabled !== false && (item.parentId || "") === parentId && item.id !== id)
     .sort((a, b) => (a.order || 0) - (b.order || 0) || a.name.localeCompare(b.name));
   const targetIndex = Math.max(0, siblings.findIndex((item) => item.id === targetId));
-  siblings.splice(targetIndex, 0, category);
+  const insertIndex = message.position === "after" ? targetIndex + 1 : targetIndex;
+  siblings.splice(insertIndex, 0, category);
   siblings.forEach((item, index) => {
     item.order = (index + 1) * 10;
   });
 
   await chromeStorageSet({ categories });
-  return Object.assign(await stateAfterCategoryAutoClassify(message), { reorderedCategory: { id, targetId } });
+  return Object.assign(await getState(), { reorderedCategory: { id, targetId, position: message.position === "after" ? "after" : "before" } });
 }
 
 async function deleteCategory(message) {

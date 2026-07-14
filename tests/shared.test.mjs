@@ -21,11 +21,19 @@ function loadBackgroundHelpers() {
     chrome: {
       runtime: {
         onInstalled: { addListener() {} },
+        onStartup: { addListener() {} },
         onMessage: { addListener() {} },
+        sendMessage() { return Promise.resolve(); },
         getURL(value) { return value; }
       },
       action: { onClicked: { addListener() {} } },
-      tabs: { create() {} }
+      tabs: { create() {} },
+      alarms: {
+        onAlarm: { addListener() {} },
+        get() { return Promise.resolve(null); },
+        clear() { return Promise.resolve(true); },
+        create() {}
+      }
     }
   };
   sandbox.globalThis = sandbox;
@@ -38,7 +46,7 @@ function loadBackgroundHelpers() {
 test("extension version is consistent across manifests", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(core.EXTENSION_VERSION, "1.1.0");
+  assert.equal(core.EXTENSION_VERSION, "1.1.3");
   assert.equal(manifest.version, core.EXTENSION_VERSION);
   assert.equal(pkg.version, core.EXTENSION_VERSION);
 });
@@ -117,7 +125,7 @@ test("sourceHash ignores popularity and volatile fields", () => {
     duration: 600,
     stat: { view: 1 }
   };
-  const changedPopularity = Object.assign({}, base, { stat: { view: 999999 }, like: 42 });
+  const changedPopularity = Object.assign({}, base, { stat: { view: 999999 }, viewCount: 999999, like: 42 });
   assert.equal(core.computeSourceHash(base), core.computeSourceHash(changedPopularity));
 });
 
@@ -142,6 +150,41 @@ test("canonicalizeVideo preserves watchlater order when details update", () => {
   assert.equal(updated.watchlaterOrder, 12);
   assert.equal(updated.watchlaterAddedAt, 1700000000);
   assert.equal(updated.pubdate, 1600000000);
+});
+
+test("watchlater video fields preserve views and normalize finished progress", () => {
+  const helpers = loadBackgroundHelpers();
+  const converted = helpers.convertBiliApiVideo({
+    bvid: "BV1xx411c7mD",
+    title: "测试视频",
+    duration: 600,
+    progress: -1,
+    stat: { view: 17234 }
+  }, 0);
+  const video = core.canonicalizeVideo(converted, null, { now: 1 });
+  assert.equal(video.viewCount, 17234);
+  assert.equal(video.watchProgress, 600);
+  assert.equal(video.isWatched, true);
+});
+
+test("watchlater partial progress survives a later detail-only update", () => {
+  const helpers = loadBackgroundHelpers();
+  const converted = helpers.convertBiliApiVideo({
+    bvid: "BV1xx411c7mD",
+    title: "测试视频",
+    duration: 600,
+    progress: 125,
+    stat: { view: 9999 }
+  }, 0);
+  const existing = core.canonicalizeVideo(converted, null, { now: 1 });
+  const updated = core.canonicalizeVideo({
+    bvid: "BV1xx411c7mD",
+    title: "详情更新后的标题",
+    viewCount: 10001
+  }, existing, { now: 2 });
+  assert.equal(updated.watchProgress, 125);
+  assert.equal(updated.isWatched, false);
+  assert.equal(updated.viewCount, 10001);
 });
 
 test("standardVideoUrl always uses the normalized bvid", () => {
@@ -468,17 +511,49 @@ test("background scan only fills unclassified videos and does not auto queue det
   assert.match(source, /FETCH_VIDEO_DETAILS:[\s\S]*?queueMissingVideoDetails\(\)/);
 });
 
-test("dashboard consolidates toolbar controls and exposes manual AI import export card", () => {
+test("dashboard consolidates AI classification, category generation and API settings", () => {
   const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
   assert.match(dashboard, /sort-combo/);
   assert.match(dashboard, /添加时间-降序/);
   assert.match(dashboard, /添加时间-升序/);
   assert.match(dashboard, /sync-refresh/);
-  assert.match(dashboard, /AI \(手动导入\/导出\) 批量视频分类/);
+  assert.match(dashboard, /AI 批量视频分类/);
+  assert.match(dashboard, /手动导入\/导出/);
+  assert.match(dashboard, /使用 API 生成/);
+  assert.match(dashboard, /手动复制 Prompt/);
+  assert.match(dashboard, /测试 API/);
+  assert.match(dashboard, /textContent: "设置API"/);
+  assert.match(dashboard, /toggle-settings-panel/);
+  assert.match(dashboard, /toggle-api-settings/);
+  assert.match(dashboard, /自动 API 视频分类/);
+  assert.match(dashboard, /待精细分类达到指定数量/);
+  assert.match(dashboard, /编辑分类目录/);
+  assert.equal(dashboard.includes("手动编辑分类目录"), false);
   assert.match(dashboard, /manual-export-limit/);
   assert.equal(dashboard.includes("keyword" + "判定"), false);
   assert.match(css, /\.exchange-panel textarea/);
+});
+
+test("dashboard renders watch progress and reorders category subtrees without automatic sync", () => {
+  const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
+  const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
+  const reorderStart = background.indexOf("async function reorderCategory");
+  const deleteStart = background.indexOf("async function deleteCategory");
+  const reorderSource = background.slice(reorderStart, deleteStart);
+  assert.match(dashboard, /view-count-badge/);
+  assert.match(dashboard, /watch-progress-value/);
+  assert.match(dashboard, /formatDuration\(watchProgress\) \+ "\/" \+ formatDuration\(duration\)/);
+  assert.match(dashboard, /category-tree-group/);
+  assert.match(dashboard, /categoryDropTargetGroup/);
+  assert.match(dashboard, /event\.preventDefault\(\);[\s\S]*?categoryNav\.scrollTop \+= event\.deltaY/);
+  assert.equal(dashboard.includes('syncAfterCategoryStructureChange("分类顺序已更新")'), false);
+  assert.match(reorderSource, /message\.position === "after"/);
+  assert.match(reorderSource, /await getState\(\)/);
+  assert.equal(reorderSource.includes("stateAfterCategoryAutoClassify"), false);
+  assert.match(css, /\.category-tree-group\.drop-before::before/);
+  assert.match(css, /\.watch-progress-value/);
 });
 
 test("dashboard exposes the manual default state and redesigned fixed batch controls", () => {
@@ -616,6 +691,22 @@ test("dashboard exposes AI API batch video classification controls", () => {
   assert.match(source, /AI 返回的内容不是严格 JSON/);
 });
 
+test("automatic API classification uses alarms and preserves manual results", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
+  const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  assert.equal(manifest.permissions.includes("alarms"), true);
+  assert.equal(core.DEFAULT_SETTINGS.llmAutoClassifyMode, "off");
+  assert.equal(core.DEFAULT_SETTINGS.llmAutoClassifyThreshold, 50);
+  assert.match(background, /AUTO_LLM_ALARM/);
+  assert.match(background, /periodInMinutes: 24 \* 60/);
+  assert.match(background, /periodInMinutes: 7 \* 24 \* 60/);
+  assert.match(background, /mode === "threshold"/);
+  assert.match(background, /core\.classificationStageCounts/);
+  assert.match(background, /exportClassifyBatch\(\{ includeAll: false/);
+  assert.match(background, /importClassifications\(JSON\.stringify\(payload\)/);
+  assert.match(background, /core\.isManualClassification\(classification\)/);
+});
+
 test("fresh install onboarding detects login and exposes three first classification paths", () => {
   const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
@@ -631,7 +722,8 @@ test("fresh install onboarding detects login and exposes three first classificat
   assert.match(dashboard, /我要手动设置我的分类/);
   assert.match(dashboard, /我有 API，让 AI 帮我调整分类/);
   assert.match(dashboard, /我没有 API，手动复制 Prompt 来生成分类目录/);
-  assert.match(dashboard, /onboarding-llm-base-url/);
+  assert.match(dashboard, /open-onboarding-api-settings/);
+  assert.match(dashboard, /llm-base-url/);
   assert.match(dashboard, /onboarding-prompt-import/);
   assert.match(dashboard, /EXPORT_CATEGORY_PROPOSAL/);
   assert.match(dashboard, /IMPORT_CATEGORIES/);
@@ -655,8 +747,9 @@ test("onboarding category-list updates do not classify videos before step three"
   const importSource = background.slice(importStart, preserveStart);
   assert.equal(importSource.includes("autoClassify("), false);
   assert.match(importSource, /appendKeywordCategories\(addedCategoryIds, categories\)/);
-  assert.match(dashboard, /source: "api",\s*skipAutoClassify: onboardingActive\(\)/);
-  assert.match(dashboard, /source: "prompt",\s*skipAutoClassify: onboardingActive\(\)/);
+  assert.match(dashboard, /confirmAndImportCategories\(payload, "api", "API"\)/);
+  assert.match(dashboard, /confirmAndImportCategories\(parseJsonObject\(payload\), "prompt", "手动 Prompt"\)/);
+  assert.match(dashboard, /source,\s*skipAutoClassify: onboardingActive\(\)/);
   assert.match(background, /message\.skipAutoClassify[\s\S]*?暂不分类视频/);
   assert.match(dashboard, /SYNC_ON_OPEN, skipAutoClassify: onboardingActive\(\)/);
   assert.match(dashboard, /syncAfterCategoryListChange/);

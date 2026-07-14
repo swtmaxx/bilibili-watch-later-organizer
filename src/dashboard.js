@@ -22,6 +22,8 @@
   let exchange = { visible: false, title: "", text: "", append: false, mode: "import" };
   let savedCategoryScrollTop = 0;
   let draggedCategoryId = "";
+  let dragDropPosition = "before";
+  let suppressCategoryClick = false;
   let batchMode = false;
   let selectedBvids = new Set();
   let batchCategoryId = "";
@@ -30,7 +32,13 @@
   let llmRun = { running: false, stopRequested: false, done: false, imported: 0, skipped: 0, processed: 0, total: 0, message: "" };
   let manualEditorOpen = false;
   let llmPanelOpen = false;
-  let manualLlmPanelOpen = false;
+  let settingsPanelOpen = false;
+  let apiSettingsOpen = false;
+  let autoApiSettingsOpen = false;
+  let apiSettingsDraft = null;
+  let autoApiSettingsDraft = null;
+  let apiTestState = { running: false, message: "" };
+  let categoryGeneration = { mode: "", running: false, loading: false, prompt: "", importText: "", message: "" };
   let syncAnimations = { added: new Set(), changed: new Set() };
   let syncAnimationTimer = 0;
   let idleDetailTimer = 0;
@@ -63,7 +71,7 @@
     app.addEventListener("pointerup", onPointerUp);
     app.addEventListener("pointercancel", onPointerUp);
     app.addEventListener("scroll", onSelectionScroll, true);
-    app.addEventListener("wheel", onWheel, { passive: true });
+    app.addEventListener("wheel", onWheel, { passive: false });
     chrome.runtime.onMessage.addListener((payload) => {
       if (payload && payload.type === message.JOB_PROGRESS) {
         state.progress = payload.progress;
@@ -284,7 +292,7 @@
         el("p", { textContent: "这里调整的是所有视频共用的分类目录，不是在给视频分配类别。默认目录不一定适合你，可以手动修改，也可以让 AI 根据现有视频重新生成。" }),
         renderOnboardingCategoryPreview("当前分类目录"),
         el("div", { className: "onboarding-options" }, [
-          onboardingOption("categories", "1", "我要手动设置我的分类", "收起引导卡片并展开右侧的手动编辑分类目录，直接修改可选分类。"),
+          onboardingOption("categories", "1", "我要手动设置我的分类", "收起引导卡片并展开右侧的编辑分类目录，直接修改可选分类。"),
           onboardingOption("api", "2", "我有 API，让 AI 帮我调整分类", "填写 API 后，AI 会根据现有视频自动生成并替换分类目录。"),
           onboardingOption("prompt", "3", "我没有 API，手动复制 Prompt 来生成分类目录", "复制分类目录 Prompt 给 AI，再把 categories JSON 导回插件。")
         ]),
@@ -292,19 +300,17 @@
       ];
     } else if (stage === "setup-api") {
       const settings = state.settings || {};
+      const configured = apiSettingsReady(settings);
       content = [
         el("div", { className: "onboarding-kicker", textContent: "首次使用 · 2 / 3 · API" }),
         el("h2", { textContent: "让 AI 生成分类目录" }),
-        el("p", { textContent: "保存后会立即把现有视频标题发给 AI，请它生成新的 categories 目录。生成目录本身不会给每个视频分类；这组配置也会用于后续的 AI (API) 批量视频分类。" }),
-        el("div", { className: "llm-grid onboarding-config-grid" }, [
-          labeledInput("API 地址", "onboarding-llm-base-url", settings.llmBaseUrl || "", "https://openrouter.ai/api/v1/chat/completions", "url"),
-          labeledInput("模型", "onboarding-llm-model", settings.llmModel || "", "例如 openai/gpt-4.1-mini", "text"),
-          labeledInput("API Key", "onboarding-llm-api-key", settings.llmApiKey || "", "sk-...", "password")
-        ]),
+        el("p", { textContent: "分类目录生成和 AI 批量视频分类共用同一组 API 设置。生成目录本身不会给每个视频分类。" }),
+        el("div", { className: "onboarding-api-state " + (configured ? "ready" : "missing"), textContent: configured ? "API 已设置，可以先测试，或直接生成分类目录。" : "API 尚未设置完整，请先到右侧“设置”中填写并测试。" }),
         onboardingCategoryMessage ? el("div", { className: "onboarding-run-status", textContent: onboardingCategoryMessage }) : null,
         el("div", { className: "onboarding-actions" }, [
           el("button", { className: "ghost", dataset: { action: "back-onboarding-setup" }, textContent: "← 返回上一步" }),
-          el("button", { className: "primary", dataset: { action: "save-onboarding-api" }, textContent: onboardingCategoryRunning ? "AI 正在生成分类目录…" : "保存并让 AI 生成分类目录" })
+          el("button", { dataset: { action: "open-onboarding-api-settings" }, textContent: "设置API" }),
+          configured ? el("button", { className: "primary", dataset: { action: "save-onboarding-api" }, textContent: onboardingCategoryRunning ? "AI 正在生成分类目录…" : "让 AI 生成分类目录" }) : null
         ])
       ].filter(Boolean);
     } else if (stage === "setup-prompt") {
@@ -337,18 +343,18 @@
         renderOnboardingCategoryPreview("新的分类目录"),
         el("div", { className: "onboarding-actions" }, [
           el("button", { className: "ghost", dataset: { action: "back-onboarding-method" }, textContent: "← 返回上一步" }),
-          el("button", { dataset: { action: "adjust-onboarding-result" }, textContent: "需要，手动编辑分类目录" }),
+          el("button", { dataset: { action: "adjust-onboarding-result" }, textContent: "需要，编辑分类目录" }),
           el("button", { className: "primary", dataset: { action: "show-onboarding-guide" }, textContent: "不需要，继续" })
         ])
       ];
     } else if (stage === "setup-categories") {
       content = [
         el("div", { className: "onboarding-kicker", textContent: "首次使用 · 2 / 3 · 手动" }),
-        el("h2", { textContent: "手动编辑分类目录" }),
-        el("p", { textContent: "手动编辑分类目录会在右侧栏展开。你可以增删、改名或调整父级，点击“确定保存”后再继续。" }),
+        el("h2", { textContent: "编辑分类目录" }),
+        el("p", { textContent: "编辑分类目录会在右侧栏展开。你可以增删、改名或调整父级，点击“确定保存”后再继续。" }),
         el("div", { className: "onboarding-actions" }, [
           el("button", { className: "ghost", dataset: { action: "back-onboarding-setup" }, textContent: "← 返回上一步" }),
-          el("button", { dataset: { action: "reopen-onboarding-categories" }, textContent: "展开手动编辑分类目录" }),
+          el("button", { dataset: { action: "reopen-onboarding-categories" }, textContent: "展开编辑分类目录" }),
           el("button", { className: "primary", dataset: { action: "show-onboarding-guide" }, textContent: "分类目录已调整，继续" })
         ])
       ];
@@ -413,8 +419,11 @@
     let titleValue = "完成首次设置";
     let description = "调整完成后，继续了解分类等级。";
     if (stage === "setup-categories") {
-      titleValue = "正在手动编辑分类目录";
-      description = "在右侧手动编辑分类目录中调整草稿，并点击“确定保存”。";
+      titleValue = "正在编辑分类目录";
+      description = "在右侧编辑分类目录中调整草稿，并点击“确定保存”。";
+    } else if (stage === "setup-api") {
+      titleValue = "正在设置 API";
+      description = "在右侧设置中保存并测试 API，然后返回首次引导。";
     } else if (stage === "classify") {
       titleValue = "完成一次首次分类";
       description = "保存手动确认、导入 JSON 或完成 AI 视频分类后，引导会自动结束。";
@@ -424,6 +433,8 @@
       el("div", { className: "onboarding-banner-actions" }, stage === "setup-categories" ? [
         el("button", { className: "ghost", dataset: { action: "back-onboarding-setup" }, textContent: "返回上一步" }),
         el("button", { className: "primary", dataset: { action: "show-onboarding-guide" }, textContent: "调整好了，继续" })
+      ] : stage === "setup-api" ? [
+        el("button", { className: "primary", dataset: { action: "resume-onboarding-api" }, textContent: "返回首次引导" })
       ] : [
         el("button", { className: "ghost", dataset: { action: "back-onboarding-guide" }, textContent: "返回上一步" }),
         el("button", { className: "ghost", dataset: { action: "complete-onboarding" }, textContent: "稍后处理" })
@@ -511,17 +522,24 @@
     core.childrenOf(state.categories, parentId).forEach((category) => {
       const expanded = expandCategoryIds([category.id]);
       const active = activeFilter.sourceCategoryId === category.id || expanded.length && expanded.every((id) => activeFilter.categoryIds.includes(id));
-      fragment.appendChild(el("button", {
-        className: "cat-row indent-" + Math.min(level, 3) + (active ? " active" : ""),
-        style: categoryStyle(category, "row"),
+      const group = el("div", {
+        className: "category-tree-group",
         draggable: true,
-        title: "拖动可在同一级分类内排序",
-        dataset: { action: "filter-category", categoryId: category.id }
+        title: "拖动可调整同级顺序；此分类及全部子分类会一起移动",
+        dataset: { categoryGroup: category.id }
       }, [
-        el("span", { className: "cat-name", textContent: category.name }),
-        el("span", { className: "cat-count", textContent: String(counts.byCategory.get(category.id) || 0) })
-      ]));
-      appendCategoryLevel(fragment, category.id, level + 1, counts);
+        el("button", {
+          className: "cat-row category-draggable indent-" + Math.min(level, 3) + (active ? " active" : ""),
+          style: categoryStyle(category, "row"),
+          dataset: { action: "filter-category", categoryId: category.id }
+        }, [
+          el("span", { className: "category-drag-handle", title: "拖动分类及其子分类", "aria-hidden": "true", textContent: "⋮⋮" }),
+          el("span", { className: "cat-name", textContent: category.name }),
+          el("span", { className: "cat-count", textContent: String(counts.byCategory.get(category.id) || 0) })
+        ])
+      ]);
+      appendCategoryLevel(group, category.id, level + 1, counts);
+      fragment.appendChild(group);
     });
   }
 
@@ -535,10 +553,11 @@
       })));
     return el("section", { className: "fold", dataset: { fold: "category-admin" } }, [
       el("button", { className: "fold-head", dataset: { action: "toggle-category-admin" } }, [
-        el("h2", { textContent: "手动编辑分类目录" }),
+        el("h2", { textContent: "编辑分类目录" }),
         el("span", { dataset: { role: "fold-icon" }, textContent: categoryAdminOpen ? "⌃" : "⌄" })
       ]),
       el("div", { className: "fold-body" + (categoryAdminOpen ? "" : " hidden") }, [
+        renderCategoryGenerationTools(),
         el("div", { className: "category-form" }, [
           el("select", { dataset: { role: "new-category-parent" } }, parentOptions),
           el("input", { type: "text", placeholder: "新分类名", dataset: { role: "new-category-name" } }),
@@ -552,6 +571,47 @@
           categoryDraftDirty ? el("span", { className: "sub", textContent: "有未保存修改" }) : null
         ].filter(Boolean))
       ].filter(Boolean))
+    ]);
+  }
+
+  function renderCategoryGenerationTools() {
+    return el("div", { className: "category-generation" }, [
+      el("div", { className: "category-generation-heading" }, [
+        el("h3", { textContent: "让 AI 生成分类目录" }),
+        el("p", { textContent: "AI 会根据现有视频设计并替换可选分类目录，不会给已有视频重新分类，也不会覆盖手动确认。" })
+      ]),
+      el("div", { className: "category-generation-actions" }, [
+        el("button", {
+          className: "primary",
+          dataset: { action: "generate-categories-api" },
+          textContent: categoryGeneration.running ? "AI 正在生成…" : "使用 API 生成"
+        }),
+        el("button", {
+          dataset: { action: "toggle-category-prompt" },
+          textContent: categoryGeneration.mode === "prompt" ? "收起手动复制" : "手动复制 Prompt"
+        }),
+        el("button", { className: "ghost", dataset: { action: "open-api-settings" }, textContent: "设置API" })
+      ]),
+      categoryGeneration.message ? el("div", { className: "category-generation-status", textContent: categoryGeneration.message }) : null,
+      categoryGeneration.mode === "prompt" ? renderCategoryPromptEditor() : null
+    ].filter(Boolean));
+  }
+
+  function renderCategoryPromptEditor() {
+    return el("div", { className: "category-prompt-editor" }, [
+      el("label", { className: "field" }, [
+        el("span", { textContent: categoryGeneration.loading ? "正在生成分类目录 Prompt…" : "复制给 ChatGPT / Gemini" }),
+        el("textarea", { readonly: "", dataset: { role: "category-prompt-text" }, value: categoryGeneration.prompt, placeholder: "点击下方按钮生成 Prompt" })
+      ]),
+      el("div", { className: "category-generation-actions" }, [
+        el("button", { dataset: { action: "load-category-prompt" }, textContent: categoryGeneration.prompt ? "重新生成 Prompt" : "生成 Prompt" }),
+        el("button", { className: "ghost", dataset: { action: "copy-category-prompt" }, textContent: "复制 Prompt" })
+      ]),
+      el("label", { className: "field" }, [
+        el("span", { textContent: "粘贴 AI 返回的 categories JSON" }),
+        el("textarea", { dataset: { role: "category-prompt-import" }, value: categoryGeneration.importText, placeholder: "{\"categories\":[{\"id\":\"study\",\"name\":\"学习\",...}]}" })
+      ]),
+      el("button", { className: "primary category-import-button", dataset: { action: "import-category-prompt" }, textContent: "导入并替换分类目录" })
     ]);
   }
 
@@ -695,9 +755,9 @@
       renderEditorHeader(),
       el("div", { className: "editor-body" }, [
         renderManualEditor(video, selectedIds),
-        renderExchange(),
         renderLlmAutomation(),
-        renderCategoryAdmin()
+        renderCategoryAdmin(),
+        renderApiSettings()
       ])
     ]);
   }
@@ -720,9 +780,9 @@
             el("button", { className: "ghost", dataset: { action: "batch-clear-selection" }, textContent: "清空选择" })
           ])
         ]),
-        renderExchange(),
         renderLlmAutomation(),
-        renderCategoryAdmin()
+        renderCategoryAdmin(),
+        renderApiSettings()
       ])
     ]);
   }
@@ -777,37 +837,42 @@
     const settings = state.settings || {};
     return el("section", { className: "fold llm-panel", dataset: { fold: "llm-panel" } }, [
       el("button", { className: "fold-head", dataset: { action: "toggle-llm-panel" } }, [
-        el("h2", { textContent: "AI (API) 批量视频分类" }),
+        el("h2", { textContent: "AI 批量视频分类" }),
         el("span", { dataset: { role: "fold-icon" }, textContent: llmPanelOpen ? "⌃" : "⌄" })
       ]),
       el("div", { className: "fold-body" + (llmPanelOpen ? "" : " hidden") }, [
+        el("section", { className: "ai-method" }, [
+          el("div", { className: "ai-method-heading" }, [
+            el("h3", { textContent: "使用 API 自动分类" }),
+            el("p", { textContent: apiSettingsReady(settings) ? "使用设置中已保存的 API；手动确认的视频始终跳过。" : "API 尚未设置完整，请先到“设置”中填写并测试。" })
+          ]),
         el("div", { className: "llm-grid" }, [
-          labeledInput("API URL", "llm-base-url", settings.llmBaseUrl || "", "https://openrouter.ai/api/v1/chat/completions", "url"),
-          labeledInput("Model", "llm-model", settings.llmModel || "", "openrouter 模型名", "text"),
-          labeledInput("API Key", "llm-api-key", settings.llmApiKey || "", "sk-...", "password"),
           labeledInput("每批数量", "llm-batch-size", settings.llmBatchSize || 50, "50", "number"),
-          labeledInput("本次数量", "llm-limit", settings.llmLimit || 0, "0 表示全部", "number"),
-          labeledInput("温度", "llm-temperature", settings.llmTemperature == null ? 0.1 : settings.llmTemperature, "0.1", "number")
+          labeledInput("本次数量", "llm-limit", settings.llmLimit || 0, "0 表示全部", "number")
         ]),
         el("label", { className: "inline-check" }, [
           el("input", { type: "checkbox", checked: settings.llmIncludeAll === true, dataset: { role: "llm-include-all" } }),
           text("重新处理已有 AI 分类")
         ]),
-        el("label", { className: "inline-check" }, [
-          el("input", { type: "checkbox", checked: settings.llmUseResponseFormat === true, dataset: { role: "llm-use-response-format" } }),
-          text("请求 JSON response_format")
-        ]),
         el("div", { className: "llm-actions" }, [
-          el("button", { dataset: { action: "save-llm-settings" }, textContent: "保存配置" }),
+          el("button", { className: "ghost", dataset: { action: "open-api-settings" }, textContent: "设置API" }),
           llmRun.running
             ? el("button", { className: "danger", dataset: { action: "stop-llm-run" }, textContent: "停止" })
-            : el("button", { className: "primary", dataset: { action: "start-llm-run" }, textContent: "启动分类" })
+            : el("button", { className: "primary", dataset: { action: "start-llm-run" }, textContent: "使用 API 开始分类" })
         ]),
         el("div", { className: "llm-progress" }, [
           el("div", { textContent: llmRun.message || "未运行" }),
           el("div", { textContent: "处理 " + (llmRun.processed || 0) + " / " + (llmRun.total || 0) + "，导入 " + (llmRun.imported || 0) + "，跳过 " + (llmRun.skipped || 0) + "，失败批次 " + failedBatchCount() }),
           llmRun.warnings && llmRun.warnings.length ? el("div", { textContent: "最近：" + llmRun.warnings[llmRun.warnings.length - 1] }) : null
         ].filter(Boolean))
+        ]),
+        el("section", { className: "ai-method manual-ai-method" }, [
+          el("div", { className: "ai-method-heading" }, [
+            el("h3", { textContent: "手动导入/导出" }),
+            el("p", { textContent: "复制 Prompt 给 ChatGPT、Gemini 或 DeepSeek，再把返回的 JSON 导入。" })
+          ]),
+          renderExchange()
+        ])
       ])
     ]);
   }
@@ -831,12 +896,7 @@
   function renderExchange() {
     const settings = state.settings || {};
     const exportLimit = settings.manualExportLimit == null ? settings.batchSize || 80 : settings.manualExportLimit;
-    return el("section", { className: "fold exchange-panel", dataset: { fold: "manual-llm-panel" } }, [
-      el("button", { className: "fold-head", dataset: { action: "toggle-manual-llm-panel" } }, [
-        el("h2", { textContent: "AI (手动导入/导出) 批量视频分类" }),
-        el("span", { dataset: { role: "fold-icon" }, textContent: manualLlmPanelOpen ? "⌃" : "⌄" })
-      ]),
-      el("div", { className: "fold-body" + (manualLlmPanelOpen ? "" : " hidden") }, [
+    return el("div", { className: "exchange-panel" }, [
         el("div", { className: "exchange-help" }, [
           el("div", { textContent: "导出只选择待精细分类的视频；手动确认结果始终跳过。" }),
           el("div", { textContent: "把 Prompt 复制给 ChatGPT/Gemini/Deepseek，再把返回的严格 JSON 粘贴回来导入。" }),
@@ -867,7 +927,80 @@
           el("button", { className: "primary", dataset: { action: "import-json" }, textContent: "导入 JSON" }),
           el("button", { className: "ghost", dataset: { action: "hide-exchange" }, textContent: "清空" })
         ])
+      ].filter(Boolean));
+  }
+
+  function renderApiSettings() {
+    return el("section", { className: "fold settings-panel", dataset: { fold: "settings-panel" } }, [
+      el("button", { className: "fold-head", dataset: { action: "toggle-settings-panel" } }, [
+        el("h2", { textContent: "设置" }),
+        el("span", { dataset: { role: "fold-icon" }, textContent: settingsPanelOpen ? "⌃" : "⌄" })
+      ]),
+      el("div", { className: "fold-body settings-body" + (settingsPanelOpen ? "" : " hidden") }, [
+        renderApiSettingsSection(),
+        renderAutoLlmSettingsSection()
+      ])
+    ]);
+  }
+
+  function renderApiSettingsSection() {
+    const settings = Object.assign({}, state.settings || {}, apiSettingsDraft || {});
+    return el("section", { className: "settings-subfold", dataset: { fold: "api-settings" } }, [
+      el("button", { className: "settings-subhead", dataset: { action: "toggle-api-settings" } }, [
+        el("h3", { textContent: "API 设置" }),
+        el("span", { dataset: { role: "fold-icon" }, textContent: apiSettingsOpen ? "⌃" : "⌄" })
+      ]),
+      el("div", { className: "settings-subbody" + (apiSettingsOpen ? "" : " hidden") }, [
+        el("div", { className: "api-settings-heading" }, [
+          el("p", { textContent: "分类目录生成和 AI 批量视频分类共用这里保存的 OpenAI-compatible API。" })
+        ]),
+        el("div", { className: "llm-grid" }, [
+          labeledInput("API URL", "llm-base-url", settings.llmBaseUrl || "", "https://openrouter.ai/api/v1", "url"),
+          labeledInput("Model", "llm-model", settings.llmModel || "", "例如 openai/gpt-4.1-mini", "text"),
+          labeledInput("API Key", "llm-api-key", settings.llmApiKey || "", "sk-...", "password"),
+          labeledInput("温度", "llm-temperature", settings.llmTemperature == null ? 0.1 : settings.llmTemperature, "0.1", "number")
+        ]),
+        el("label", { className: "inline-check" }, [
+          el("input", { type: "checkbox", checked: settings.llmUseResponseFormat === true, dataset: { role: "llm-use-response-format" } }),
+          text("请求 JSON response_format")
+        ]),
+        el("div", { className: "llm-actions" }, [
+          el("button", { className: "primary", dataset: { action: "save-llm-settings" }, textContent: "保存 API 设置" }),
+          el("button", { dataset: { action: "test-llm-api" }, textContent: apiTestState.running ? "正在测试…" : "测试 API" })
+        ]),
+        apiTestState.message ? el("div", { className: "api-test-status", textContent: apiTestState.message }) : null
       ].filter(Boolean))
+    ]);
+  }
+
+  function renderAutoLlmSettingsSection() {
+    const settings = Object.assign({}, state.settings || {}, autoApiSettingsDraft || {});
+    const mode = settings.llmAutoClassifyMode || "off";
+    return el("section", { className: "settings-subfold", dataset: { fold: "auto-api-settings" } }, [
+      el("button", { className: "settings-subhead", dataset: { action: "toggle-auto-api-settings" } }, [
+        el("h3", { textContent: "自动 API 视频分类" }),
+        el("span", { dataset: { role: "fold-icon" }, textContent: autoApiSettingsOpen ? "⌃" : "⌄" })
+      ]),
+      el("div", { className: "settings-subbody" + (autoApiSettingsOpen ? "" : " hidden") }, [
+        el("p", { className: "settings-help", textContent: "自动处理待精细分类的视频，手动确认始终跳过。浏览器需保持运行，实际触发时间可能稍有延迟。" }),
+        el("label", { className: "field" }, [
+          el("span", { textContent: "自动分类条件" }),
+          el("select", { dataset: { role: "llm-auto-classify-mode" } }, [
+            option("off", "关闭", mode),
+            option("daily", "每天", mode),
+            option("weekly", "每周", mode),
+            option("threshold", "待精细分类达到指定数量", mode)
+          ])
+        ]),
+        labeledInput("待精细分类达到数量（仅数量模式）", "llm-auto-classify-threshold", settings.llmAutoClassifyThreshold || 50, "50", "number"),
+        el("div", { className: "auto-api-status" }, [
+          el("div", { textContent: "上次运行：" + formatSettingsTime(settings.llmAutoClassifyLastRunAt) }),
+          el("div", { textContent: settings.llmAutoClassifyLastStatus || "尚未自动运行" })
+        ]),
+        el("div", { className: "llm-actions" }, [
+          el("button", { className: "primary", dataset: { action: "save-auto-llm-settings" }, textContent: "保存自动分类设置" })
+        ])
+      ])
     ]);
   }
 
@@ -897,6 +1030,11 @@
       backToOnboardingMethod();
     } else if (action === "save-onboarding-api") {
       saveOnboardingApi();
+    } else if (action === "open-onboarding-api-settings") {
+      openOnboardingApiSettings();
+    } else if (action === "resume-onboarding-api") {
+      onboardingPanelDismissed = false;
+      renderShell();
     } else if (action === "copy-onboarding-prompt") {
       copyOnboardingPrompt();
     } else if (action === "regenerate-onboarding-prompt") {
@@ -920,6 +1058,7 @@
       activeFilter = { categoryIds: [], includeUnclassified: true, includeRemoved: false, sourceCategoryId: "" };
       renderShell();
     } else if (action === "filter-category") {
+      if (suppressCategoryClick) return;
       const categoryId = target.dataset.categoryId;
       activeFilter = activeFilter.sourceCategoryId === categoryId
         ? { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" }
@@ -957,6 +1096,12 @@
       bulkClearCategories();
     } else if (action === "save-llm-settings") {
       saveLlmSettings();
+    } else if (action === "save-auto-llm-settings") {
+      saveAutoLlmSettings();
+    } else if (action === "test-llm-api") {
+      testLlmApi();
+    } else if (action === "open-api-settings") {
+      openApiSettings("请在“设置”中填写、保存并测试 API");
     } else if (action === "start-llm-run") {
       startLlmRun();
     } else if (action === "stop-llm-run") {
@@ -967,9 +1112,15 @@
     } else if (action === "toggle-llm-panel") {
       llmPanelOpen = !llmPanelOpen;
       toggleFoldNode("llm-panel", llmPanelOpen);
-    } else if (action === "toggle-manual-llm-panel") {
-      manualLlmPanelOpen = !manualLlmPanelOpen;
-      toggleFoldNode("manual-llm-panel", manualLlmPanelOpen);
+    } else if (action === "toggle-settings-panel") {
+      settingsPanelOpen = !settingsPanelOpen;
+      toggleFoldNode("settings-panel", settingsPanelOpen);
+    } else if (action === "toggle-api-settings") {
+      apiSettingsOpen = !apiSettingsOpen;
+      toggleFoldNode("api-settings", apiSettingsOpen);
+    } else if (action === "toggle-auto-api-settings") {
+      autoApiSettingsOpen = !autoApiSettingsOpen;
+      toggleFoldNode("auto-api-settings", autoApiSettingsOpen);
     } else if (action === "toggle-category-admin") {
       categoryAdminOpen = !categoryAdminOpen;
       toggleFoldNode("category-admin", categoryAdminOpen);
@@ -1002,6 +1153,16 @@
       saveCategoryDraft();
     } else if (action === "discard-category-draft") {
       discardCategoryDraft();
+    } else if (action === "generate-categories-api") {
+      generateCategoriesWithApi();
+    } else if (action === "toggle-category-prompt") {
+      toggleCategoryPrompt();
+    } else if (action === "load-category-prompt") {
+      loadCategoryPrompt();
+    } else if (action === "copy-category-prompt") {
+      copyCategoryPrompt();
+    } else if (action === "import-category-prompt") {
+      importCategoryPrompt();
     } else if (action === "save-manual") {
       saveManualClassification(target.dataset.bvid);
     } else if (action === "remove-watchlater") {
@@ -1071,20 +1232,14 @@
 
   async function saveOnboardingApi() {
     if (onboardingCategoryRunning) return;
-    const llmBaseUrl = valueByRole("onboarding-llm-base-url");
-    const llmModel = valueByRole("onboarding-llm-model");
-    const llmApiKey = valueByRole("onboarding-llm-api-key");
-    if (!llmBaseUrl || !llmModel || !llmApiKey) {
-      setStatus("请完整填写 API 地址、模型和 API Key");
+    const config = Object.assign({}, state.settings || {});
+    if (!apiSettingsReady(config)) {
+      openOnboardingApiSettings();
+      setStatus("API 尚未设置完整，请先在“设置”中填写并测试 API");
       return;
     }
-    const config = Object.assign({}, state.settings || {}, { llmBaseUrl, llmModel, llmApiKey });
-    setStatus("正在保存 API，并让 AI 生成新的分类目录…");
+    setStatus("正在让 AI 生成新的分类目录…");
     try {
-      updateState(await send({
-        type: message.UPDATE_SETTINGS,
-        settings: { llmBaseUrl, llmModel, llmApiKey }
-      }));
       onboardingCategoryRunning = true;
       onboardingCategoryMessage = "正在读取现有视频标题并请求 AI…";
       renderShell();
@@ -1092,21 +1247,22 @@
       onboardingCategoryMessage = "已抽取 " + (exported.sampleCount || 0) + " 个标题，正在生成分类目录...";
       renderShell();
       const payload = await callCategoryLlm(config, exported.prompt || "");
-      const result = await send({
-        type: message.IMPORT_CATEGORIES,
-        payload,
-        source: "api",
-        skipAutoClassify: onboardingActive()
-      });
       onboardingCategoryRunning = false;
       onboardingCategoryMessage = "";
-      await handleOnboardingCategoryImport(result, "API");
+      await confirmAndImportCategories(payload, "api", "API");
     } catch (error) {
       onboardingCategoryRunning = false;
       onboardingCategoryMessage = "更新失败：" + error.message;
-      renderShell();
-      setStatus("AI 生成分类目录失败：" + error.message);
+      openOnboardingApiSettings();
+      setStatus("AI 生成分类目录失败：" + error.message + "；请先在“设置”中检查并测试 API");
     }
+  }
+
+  function openOnboardingApiSettings() {
+    onboardingPanelDismissed = true;
+    settingsPanelOpen = true;
+    apiSettingsOpen = true;
+    renderShell();
   }
 
   async function loadOnboardingPrompt() {
@@ -1151,13 +1307,7 @@
     }
     setStatus("正在导入新的分类目录 JSON…");
     try {
-      const result = await send({
-        type: message.IMPORT_CATEGORIES,
-        payload: parseJsonObject(payload),
-        source: "prompt",
-        skipAutoClassify: onboardingActive()
-      });
-      await handleOnboardingCategoryImport(result, "手动 Prompt");
+      await confirmAndImportCategories(parseJsonObject(payload), "prompt", "手动 Prompt");
     } catch (error) {
       setStatus("导入分类目录失败：" + error.message);
     }
@@ -1187,18 +1337,16 @@
       revealOnboardingPanel("categories");
     } catch (error) {
       onboardingPanelDismissed = false;
-      setStatus("打开手动编辑分类目录失败：" + error.message);
+      setStatus("打开编辑分类目录失败：" + error.message);
     }
   }
 
   function revealOnboardingPanel(methodName) {
     const foldName = methodName === "categories"
       ? "category-admin"
-      : methodName === "api"
-        ? "llm-panel"
         : methodName === "manual"
           ? "manual-editor"
-          : "manual-llm-panel";
+          : "llm-panel";
     setTimeout(() => {
       const node = document.querySelector('[data-fold="' + foldName + '"]');
       if (node) node.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1218,11 +1366,17 @@
     const modeName = ["manual", "prompt", "api"].includes(modeValue) ? modeValue : "manual";
     onboardingPanelDismissed = true;
     if (modeName === "manual") manualEditorOpen = true;
-    if (modeName === "prompt") manualLlmPanelOpen = true;
-    if (modeName === "api") llmPanelOpen = true;
+    if (modeName === "prompt" || modeName === "api") llmPanelOpen = true;
+    if (modeName === "api" && !apiSettingsReady(state.settings || {})) {
+      settingsPanelOpen = true;
+      apiSettingsOpen = true;
+    }
     try {
       await updateOnboardingSettings({ onboardingStage: "classify" });
       if (modeName === "prompt") await exportInitialPrompt();
+      if (modeName === "api" && !apiSettingsReady(state.settings || {})) {
+        setStatus("API 尚未设置完整，请先在“设置”中填写并测试 API");
+      }
       revealOnboardingPanel(modeName === "manual" ? "manual" : modeName);
     } catch (error) {
       onboardingPanelDismissed = false;
@@ -1266,35 +1420,42 @@
   }
 
   function onDragStart(event) {
-    const row = event.target.closest("[data-category-id]");
-    if (!row || !row.draggable) return;
-    draggedCategoryId = row.dataset.categoryId || "";
-    row.classList.add("dragging");
+    const group = event.target.closest(".category-tree-group[data-category-group]");
+    if (!group || !group.draggable) return;
+    draggedCategoryId = group.dataset.categoryGroup || "";
+    dragDropPosition = "before";
+    suppressCategoryClick = true;
+    group.classList.add("dragging");
     if (event.dataTransfer) {
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", draggedCategoryId);
+      event.dataTransfer.setDragImage(group, 18, 18);
     }
   }
 
   function onDragOver(event) {
-    const row = event.target.closest("[data-category-id]");
-    if (!row || !draggedCategoryId || row.dataset.categoryId === draggedCategoryId) return;
-    if (!canDropCategory(draggedCategoryId, row.dataset.categoryId)) return;
+    const group = categoryDropTargetGroup(event.target, draggedCategoryId);
+    if (!group || !draggedCategoryId || group.dataset.categoryGroup === draggedCategoryId) return;
+    if (!canDropCategory(draggedCategoryId, group.dataset.categoryGroup)) return;
     event.preventDefault();
-    document.querySelectorAll(".drop-target").forEach((node) => {
-      if (node !== row) node.classList.remove("drop-target");
+    dragDropPosition = categoryDropPosition(group, event.clientY);
+    document.querySelectorAll(".drop-before,.drop-after").forEach((node) => {
+      if (node !== group) node.classList.remove("drop-before", "drop-after");
     });
-    row.classList.add("drop-target");
+    group.classList.toggle("drop-before", dragDropPosition === "before");
+    group.classList.toggle("drop-after", dragDropPosition === "after");
     if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
   }
 
   async function onDrop(event) {
-    const row = event.target.closest("[data-category-id]");
-    if (!row || !draggedCategoryId) return;
-    const targetId = row.dataset.categoryId || "";
+    const group = categoryDropTargetGroup(event.target, draggedCategoryId);
+    if (!group || !draggedCategoryId) return;
+    const targetId = group.dataset.categoryGroup || "";
+    const position = categoryDropPosition(group, event.clientY);
     clearDragClasses();
     if (!targetId || targetId === draggedCategoryId || !canDropCategory(draggedCategoryId, targetId)) {
       draggedCategoryId = "";
+      releaseCategoryClickSuppression();
       return;
     }
     event.preventDefault();
@@ -1304,26 +1465,51 @@
         type: message.REORDER_CATEGORY,
         id: draggedCategoryId,
         targetId,
-        skipAutoClassify: onboardingActive() && onboardingStage() === "setup-categories"
+        position
       }));
-      setStatus("已调整分类顺序；" + keywordStatusText(state.autoClassifyResult || {}));
-      await syncAfterCategoryStructureChange("分类顺序已更新");
+      setStatus("已调整分类顺序；未触发视频同步或重新分类");
     } catch (error) {
       setStatus("排序失败：" + error.message);
     } finally {
       draggedCategoryId = "";
+      releaseCategoryClickSuppression();
     }
   }
 
   function onDragEnd() {
     clearDragClasses();
     draggedCategoryId = "";
+    releaseCategoryClickSuppression();
+  }
+
+  function releaseCategoryClickSuppression() {
+    setTimeout(() => {
+      suppressCategoryClick = false;
+    }, 120);
   }
 
   function clearDragClasses() {
-    document.querySelectorAll(".dragging,.drop-target").forEach((node) => {
-      node.classList.remove("dragging", "drop-target");
+    document.querySelectorAll(".dragging,.drop-before,.drop-after").forEach((node) => {
+      node.classList.remove("dragging", "drop-before", "drop-after");
     });
+  }
+
+  function categoryDropTargetGroup(target, draggedId) {
+    const dragged = state.categories.find((item) => item.id === draggedId);
+    let group = target && target.closest ? target.closest(".category-tree-group[data-category-group]") : null;
+    while (group && dragged) {
+      const category = state.categories.find((item) => item.id === group.dataset.categoryGroup);
+      if (category && (category.parentId || "") === (dragged.parentId || "")) return group;
+      group = group.parentElement && group.parentElement.closest(".category-tree-group[data-category-group]");
+    }
+    return null;
+  }
+
+  function categoryDropPosition(group, clientY) {
+    const row = Array.from(group.children).find((child) => child.classList && child.classList.contains("cat-row"));
+    if (!row) return "before";
+    const rect = row.getBoundingClientRect();
+    return clientY < rect.top + rect.height / 2 ? "before" : "after";
   }
 
   function canDropCategory(id, targetId) {
@@ -1338,6 +1524,12 @@
       renderVideoResults();
     } else if (event.target.dataset.role === "exchange-text") {
       exchange.text = event.target.value;
+    } else if (event.target.dataset.role === "category-prompt-import") {
+      categoryGeneration.importText = event.target.value;
+    } else if (["llm-base-url", "llm-model", "llm-api-key", "llm-temperature", "llm-use-response-format"].includes(event.target.dataset.role)) {
+      apiSettingsDraft = collectApiSettings();
+    } else if (event.target.dataset.role === "llm-auto-classify-threshold") {
+      autoApiSettingsDraft = collectAutoLlmSettings();
     } else if (event.target.dataset.role === "category-name") {
       const category = ensureCategoryDraft().find((item) => item.id === event.target.dataset.categoryId);
       if (category) category.name = event.target.value;
@@ -1413,7 +1605,15 @@
     if (!cancelled && (moved || suppressNextCardClick)) renderEditorOnly();
   }
 
-  function onWheel() {
+  function onWheel(event) {
+    if (draggedCategoryId) {
+      const categoryNav = document.querySelector(".cat-nav");
+      if (categoryNav && event.deltaY) {
+        categoryNav.scrollTop += event.deltaY;
+        event.preventDefault();
+      }
+      return;
+    }
     if (!selectionBox || !selectionBox.hasMoved) return;
     scheduleSelectionScrollUpdate();
   }
@@ -1590,6 +1790,8 @@
       send({ type: message.UPDATE_SETTINGS, settings: { manualExportLimit: manualExportLimit() } })
         .then(updateState)
         .catch((error) => setStatus(error.message));
+    } else if (role === "llm-auto-classify-mode") {
+      autoApiSettingsDraft = collectAutoLlmSettings();
     } else if (role === "batch-category") {
       batchCategoryId = event.target.value;
       updateBatchCategorySwatch();
@@ -1621,8 +1823,9 @@
       renderEditorOnly();
       return;
     }
-    const body = section.querySelector(".fold-body");
-    const icon = section.querySelector('[data-role="fold-icon"]');
+    const body = Array.from(section.children).find((child) => child.classList && (child.classList.contains("fold-body") || child.classList.contains("settings-subbody")));
+    const head = section.firstElementChild;
+    const icon = head && head.querySelector('[data-role="fold-icon"]');
     if (body) body.classList.toggle("hidden", !open);
     if (icon) icon.textContent = open ? "⌃" : "⌄";
   }
@@ -1809,7 +2012,7 @@
         append: result.mergeMode === "append",
         mode: "export"
       };
-      manualLlmPanelOpen = true;
+      llmPanelOpen = true;
       renderEditorOnly();
       setStatus("已生成 " + (result.batchSize || 0) + " 个待精细分类视频的提示词，候选共 " + (result.totalCandidates || 0) + " 个");
     } catch (error) {
@@ -1825,7 +2028,7 @@
       append: false,
       mode: "import"
     };
-    manualLlmPanelOpen = true;
+    llmPanelOpen = true;
     renderEditorOnly();
   }
 
@@ -1858,26 +2061,103 @@
     }
   }
 
-  function collectLlmSettings() {
+  function collectApiSettings() {
     return {
       llmBaseUrl: valueByRole("llm-base-url"),
       llmModel: valueByRole("llm-model"),
       llmApiKey: valueByRole("llm-api-key"),
-      llmBatchSize: numberByRole("llm-batch-size", 50),
-      llmLimit: numberByRole("llm-limit", 0),
       llmTemperature: numberByRole("llm-temperature", 0.1),
-      llmIncludeAll: checkedByRole("llm-include-all"),
       llmUseResponseFormat: checkedByRole("llm-use-response-format")
     };
+  }
+
+  function collectLlmRunSettings() {
+    return {
+      llmBatchSize: numberByRole("llm-batch-size", 50),
+      llmLimit: numberByRole("llm-limit", 0),
+      llmIncludeAll: checkedByRole("llm-include-all")
+    };
+  }
+
+  function collectAutoLlmSettings() {
+    return {
+      llmAutoClassifyMode: valueByRole("llm-auto-classify-mode") || "off",
+      llmAutoClassifyThreshold: Math.min(10000, Math.max(1, Math.floor(numberByRole("llm-auto-classify-threshold", 50))))
+    };
+  }
+
+  function apiSettingsReady(config) {
+    return Boolean(core.normalizeText(config && config.llmBaseUrl) && core.normalizeText(config && config.llmModel) && core.normalizeText(config && config.llmApiKey));
+  }
+
+  function openApiSettings(statusMessage) {
+    settingsPanelOpen = true;
+    apiSettingsOpen = true;
+    renderEditorOnly();
+    if (statusMessage) setStatus(statusMessage);
   }
 
   async function saveLlmSettings() {
     setStatus("正在保存 AI API 配置…");
     try {
-      updateState(await send({ type: message.UPDATE_SETTINGS, settings: collectLlmSettings() }));
+      const config = collectApiSettings();
+      if (!apiSettingsReady(config)) {
+        setStatus("请完整填写 API URL、Model 和 API Key 后再保存");
+        return;
+      }
+      const nextState = await send({ type: message.UPDATE_SETTINGS, settings: config });
+      apiSettingsDraft = null;
+      updateState(nextState);
       setStatus("已保存 AI API 配置");
     } catch (error) {
       setStatus("保存 AI API 配置失败：" + error.message);
+    }
+  }
+
+  async function saveAutoLlmSettings() {
+    const nextSettings = collectAutoLlmSettings();
+    if (nextSettings.llmAutoClassifyMode !== "off" && !apiSettingsReady(state.settings || {})) {
+      openApiSettings("启用自动 API 视频分类前，请先在“API 设置”中填写、保存并测试 API");
+      return;
+    }
+    setStatus("正在保存自动 API 视频分类设置…");
+    try {
+      const nextState = await send({ type: message.UPDATE_SETTINGS, settings: nextSettings });
+      autoApiSettingsDraft = null;
+      updateState(nextState);
+      const labels = { off: "关闭", daily: "每天", weekly: "每周", threshold: "按待精细分类数量" };
+      setStatus("已保存自动 API 视频分类设置：" + (labels[nextSettings.llmAutoClassifyMode] || "关闭"));
+    } catch (error) {
+      setStatus("保存自动 API 视频分类设置失败：" + error.message);
+    }
+  }
+
+  async function testLlmApi() {
+    if (apiTestState.running) return;
+    const config = collectApiSettings();
+    if (!apiSettingsReady(config)) {
+      apiTestState = { running: false, message: "请先完整填写 API URL、Model 和 API Key。" };
+      renderEditorOnly();
+      setStatus("API 尚未设置完整，请先填写必填项");
+      return;
+    }
+    apiSettingsDraft = config;
+    apiTestState = { running: true, message: "正在发送最小测试请求…" };
+    renderEditorOnly();
+    try {
+      const response = await sendLlmRequest(config, "请只回复一个简短的 JSON 对象：{\"ok\":true}", false, 30000);
+      const textValue = await response.text();
+      if (!response.ok) throw new Error("HTTP " + response.status + ": " + textValue.slice(0, 240));
+      const data = parseJsonObject(textValue);
+      const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+      if (!core.normalizeText(content)) throw new Error("响应缺少 choices[0].message.content");
+      apiTestState = { running: false, message: "测试通过。当前 API 可以正常响应；如有修改，请点击“保存 API 设置”。" };
+      setStatus("API 测试通过");
+    } catch (error) {
+      apiTestState = { running: false, message: "测试失败：" + error.message + "。请检查地址、模型、密钥或服务余额。" };
+      setStatus("API 测试失败：" + error.message + "；请先在“设置”中修正 API");
+    } finally {
+      renderEditorOnly();
     }
   }
 
@@ -1890,17 +2170,9 @@
 
   async function startLlmRun() {
     if (llmRun.running) return;
-    const config = Object.assign({}, state.settings || {}, collectLlmSettings());
-    if (!core.normalizeText(config.llmBaseUrl)) {
-      setStatus("请先填写 API URL");
-      return;
-    }
-    if (!core.normalizeText(config.llmModel)) {
-      setStatus("请先填写 Model");
-      return;
-    }
-    if (!core.normalizeText(config.llmApiKey)) {
-      setStatus("请先填写 API Key");
+    const config = Object.assign({}, state.settings || {}, collectLlmRunSettings());
+    if (!apiSettingsReady(config)) {
+      openApiSettings("API 尚未设置完整，请先在“设置”中填写、保存并测试 API");
       return;
     }
 
@@ -1923,13 +2195,22 @@
       updateState(await send({ type: message.UPDATE_SETTINGS, settings: config }));
       await runLlmBatches(config);
       llmRun.done = true;
-      llmRun.message = llmRun.stopRequested ? "已停止" : "AI (API) 批量视频分类完成";
+      const failed = failedBatchCount();
+      llmRun.message = llmRun.stopRequested ? "已停止" : failed ? "API 分类有 " + failed + " 个批次失败" : "AI (API) 批量视频分类完成";
       updateState(await send({ type: message.GET_STATE }));
-      setStatus(llmRun.message + "：导入 " + llmRun.imported + " 项，跳过 " + llmRun.skipped + " 项");
       if (llmRun.imported) await finishClassificationAndSync("AI (API) 批量视频分类已更新");
+      if (failed) {
+        settingsPanelOpen = true;
+        apiSettingsOpen = true;
+        setStatus(llmRun.message + "：导入 " + llmRun.imported + " 项；请先在“设置”中检查并测试 API");
+      } else {
+        setStatus(llmRun.message + "：导入 " + llmRun.imported + " 项，跳过 " + llmRun.skipped + " 项");
+      }
     } catch (error) {
       llmRun.message = "AI (API) 批量视频分类失败：" + error.message;
-      setStatus(llmRun.message);
+      settingsPanelOpen = true;
+      apiSettingsOpen = true;
+      setStatus(llmRun.message + "；请先在“设置”中检查并测试 API");
     } finally {
       llmRun.running = false;
       renderEditorOnly();
@@ -2040,7 +2321,8 @@
     let response = await sendLlmRequest(config, requestPrompt, useResponseFormat);
     let textValue = await response.text();
     if (!response.ok && useResponseFormat && /response[_ ]format|json_object/i.test(textValue)) {
-      onboardingCategoryMessage = "模型不支持 json_object，正在用普通 JSON 模式重试...";
+      if (onboardingCategoryRunning) onboardingCategoryMessage = "模型不支持 json_object，正在用普通 JSON 模式重试…";
+      if (categoryGeneration.running) categoryGeneration.message = "模型不支持 json_object，正在用普通 JSON 模式重试…";
       renderShell();
       response = await sendLlmRequest(config, requestPrompt, false);
       textValue = await response.text();
@@ -2060,7 +2342,7 @@
     return payload;
   }
 
-  async function sendLlmRequest(config, requestPrompt, useResponseFormat) {
+  async function sendLlmRequest(config, requestPrompt, useResponseFormat, timeoutMs) {
     const body = {
       model: config.llmModel,
       temperature: Number(config.llmTemperature) || 0,
@@ -2080,7 +2362,7 @@
         "x-title": "Bili Watchlater Classifier"
       },
       body: JSON.stringify(body)
-    }, 120000);
+    }, timeoutMs || 120000);
   }
 
   function normalizeLlmPayload(payload) {
@@ -2143,6 +2425,125 @@
     const url = core.normalizeText(value).replace(/\/+$/g, "");
     if (!url) return "";
     return /\/chat\/completions$/i.test(url) ? url : url + "/chat/completions";
+  }
+
+  function toggleCategoryPrompt() {
+    categoryGeneration.mode = categoryGeneration.mode === "prompt" ? "" : "prompt";
+    renderEditorOnly();
+    if (categoryGeneration.mode === "prompt" && !categoryGeneration.prompt) loadCategoryPrompt();
+  }
+
+  async function loadCategoryPrompt() {
+    if (categoryGeneration.loading) return;
+    categoryGeneration.mode = "prompt";
+    categoryGeneration.loading = true;
+    categoryGeneration.message = "正在根据现有视频生成分类目录 Prompt…";
+    renderEditorOnly();
+    try {
+      const result = await send({ type: message.EXPORT_CATEGORY_PROPOSAL, limit: 60 });
+      categoryGeneration.prompt = result.prompt || "";
+      categoryGeneration.message = "已根据 " + (result.sampleCount || 0) + " 个视频标题生成 Prompt。";
+      setStatus(categoryGeneration.message);
+    } catch (error) {
+      categoryGeneration.prompt = "";
+      categoryGeneration.message = "生成 Prompt 失败：" + error.message;
+      setStatus(categoryGeneration.message);
+    } finally {
+      categoryGeneration.loading = false;
+      renderEditorOnly();
+    }
+  }
+
+  async function copyCategoryPrompt() {
+    if (!categoryGeneration.prompt) {
+      setStatus("请先生成分类目录 Prompt");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(categoryGeneration.prompt);
+      setStatus("分类目录 Prompt 已复制到剪贴板");
+    } catch (error) {
+      setStatus("复制分类目录 Prompt 失败：" + error.message);
+    }
+  }
+
+  async function importCategoryPrompt() {
+    const raw = valueByRole("category-prompt-import") || categoryGeneration.importText;
+    if (!core.normalizeText(raw)) {
+      setStatus("请先粘贴 AI 返回的 categories JSON");
+      return;
+    }
+    categoryGeneration.importText = raw;
+    try {
+      await confirmAndImportCategories(parseJsonObject(raw), "prompt", "手动 Prompt");
+    } catch (error) {
+      categoryGeneration.message = "导入分类目录失败：" + error.message;
+      setStatus(categoryGeneration.message);
+      renderEditorOnly();
+    }
+  }
+
+  async function generateCategoriesWithApi() {
+    if (categoryGeneration.running) return;
+    const config = Object.assign({}, state.settings || {});
+    if (!apiSettingsReady(config)) {
+      openApiSettings("API 尚未设置完整，请先在“设置”中填写、保存并测试 API");
+      return;
+    }
+    categoryGeneration.running = true;
+    categoryGeneration.message = "正在读取现有视频标题…";
+    renderEditorOnly();
+    try {
+      const exported = await send({ type: message.EXPORT_CATEGORY_PROPOSAL, limit: 60 });
+      categoryGeneration.message = "已抽取 " + (exported.sampleCount || 0) + " 个标题，正在请求 AI 生成分类目录…";
+      renderEditorOnly();
+      const payload = await callCategoryLlm(config, exported.prompt || "");
+      categoryGeneration.running = false;
+      await confirmAndImportCategories(payload, "api", "API");
+    } catch (error) {
+      categoryGeneration.running = false;
+      categoryGeneration.message = "API 生成分类目录失败：" + error.message;
+      settingsPanelOpen = true;
+      apiSettingsOpen = true;
+      setStatus(categoryGeneration.message + "；请先在“设置”中检查并测试 API");
+      renderEditorOnly();
+    }
+  }
+
+  async function confirmAndImportCategories(payload, source, sourceLabel) {
+    const count = Array.isArray(payload && payload.categories) ? payload.categories.length : 0;
+    if (!count) throw new Error("AI 返回中没有 categories 数组");
+    const confirmed = await confirmAction({
+      title: "替换分类目录？",
+      message: "将使用 AI 生成的 " + count + " 项分类替换当前分类目录。这不是在给已有视频重新分类，手动确认的视频分类不会被覆盖。",
+      confirmLabel: "确认替换"
+    });
+    if (!confirmed) {
+      categoryGeneration.message = "已取消替换分类目录。";
+      setStatus(categoryGeneration.message);
+      renderEditorOnly();
+      return false;
+    }
+    setStatus("正在导入并替换分类目录…");
+    const result = await send({
+      type: message.IMPORT_CATEGORIES,
+      payload,
+      source,
+      skipAutoClassify: onboardingActive()
+    });
+    categoryDraft = null;
+    categoryDraftDirty = false;
+    categoryGeneration.importText = "";
+    categoryGeneration.message = sourceLabel + " 已生成新的分类目录。";
+    if (onboardingActive()) {
+      await handleOnboardingCategoryImport(result, sourceLabel);
+    } else {
+      updateState(result);
+      await syncAfterCategoryListChange("分类目录已替换");
+      const imported = result.categoryImportResult || {};
+      setStatus(sourceLabel + " 已替换分类目录：" + (imported.imported || state.categories.length) + " 项；手动确认的视频分类未改变");
+    }
+    return true;
   }
 
   function addCategory() {
@@ -2490,10 +2891,42 @@
   }
 
   function renderCover(video) {
+    const watchProgress = videoWatchProgress(video);
+    const duration = Number(video && video.duration) || 0;
+    const progressPercent = duration > 0 && watchProgress > 0 ? Math.min(100, watchProgress / duration * 100) : 0;
     return el("div", { className: "cover-wrap" }, [
       coverNode(video, "cover"),
-      video && video.duration ? el("span", { className: "duration-badge", textContent: formatDuration(video.duration) }) : null
+      Number(video && video.viewCount) >= 0 ? el("span", { className: "view-count-badge" }, [
+        iconNode("play"),
+        el("span", { textContent: formatViewCount(video.viewCount) })
+      ]) : null,
+      duration ? el("span", {
+        className: "duration-badge",
+        textContent: watchProgress > 0 ? formatDuration(watchProgress) + "/" + formatDuration(duration) : formatDuration(duration)
+      }) : null,
+      progressPercent > 0 ? el("span", { className: "watch-progress", "aria-hidden": "true" }, [
+        el("span", { className: "watch-progress-value", style: "width:" + progressPercent.toFixed(2) + "%;" })
+      ]) : null
     ].filter(Boolean));
+  }
+
+  function videoWatchProgress(video) {
+    const duration = Number(video && video.duration) || 0;
+    if (video && video.isWatched && duration > 0) return duration;
+    const progress = Number(video && video.watchProgress);
+    if (!Number.isFinite(progress) || progress <= 0) return 0;
+    return duration > 0 ? Math.min(progress, duration) : progress;
+  }
+
+  function formatViewCount(value) {
+    const count = Math.max(0, Number(value) || 0);
+    if (count >= 100000000) return trimCount(count / 100000000) + "亿";
+    if (count >= 10000) return trimCount(count / 10000) + "万";
+    return Math.floor(count).toLocaleString("zh-CN");
+  }
+
+  function trimCount(value) {
+    return value >= 100 ? String(Math.floor(value)) : value.toFixed(1).replace(/\.0$/, "");
   }
 
   function statusLabel(status) {
@@ -2521,9 +2954,12 @@
   function formatDuration(seconds) {
     const value = Number(seconds);
     if (!Number.isFinite(value) || value <= 0) return "";
-    const minutes = Math.floor(value / 60);
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor(value % 3600 / 60);
     const rest = Math.floor(value % 60);
-    return minutes + ":" + String(rest).padStart(2, "0");
+    return hours > 0
+      ? hours + ":" + String(minutes).padStart(2, "0") + ":" + String(rest).padStart(2, "0")
+      : minutes + ":" + String(rest).padStart(2, "0");
   }
 
   function formatDate(timestamp) {
@@ -2533,6 +2969,14 @@
     const date = new Date(ms);
     if (Number.isNaN(date.getTime())) return "";
     return "发布 " + date.toLocaleDateString("zh-CN");
+  }
+
+  function formatSettingsTime(timestamp) {
+    const value = Number(timestamp);
+    if (!Number.isFinite(value) || value <= 0) return "尚未运行";
+    const date = new Date(value < 100000000000 ? value * 1000 : value);
+    if (Number.isNaN(date.getTime())) return "尚未运行";
+    return date.toLocaleString("zh-CN");
   }
 
   function formatWatchlaterDate(timestamp) {
@@ -2704,6 +3148,10 @@
       ],
       trash: [
         ["path", Object.assign({ d: "M5.5 7h13M9.3 7V4.8h5.4V7M7.5 7l.8 12h7.4l.8-12M10.2 10.2v5.6M13.8 10.2v5.6" }, commonStroke)]
+      ],
+      play: [
+        ["rect", Object.assign({ x: "3.5", y: "5.5", width: "17", height: "13", rx: "3" }, commonStroke)],
+        ["path", { d: "m10 9 5 3-5 3Z", fill: "currentColor" }]
       ],
       spinner: [
         ["circle", Object.assign({ cx: "12", cy: "12", r: "8.2", opacity: ".25" }, commonStroke)],
