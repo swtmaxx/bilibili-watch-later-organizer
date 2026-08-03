@@ -266,6 +266,9 @@ async function updateSettings(nextSettings) {
   if (typeof nextSettings.llmUseResponseFormat === "boolean") {
     settings.llmUseResponseFormat = nextSettings.llmUseResponseFormat;
   }
+  if (typeof nextSettings.llmApiFormat === "string") {
+    settings.llmApiFormat = core.normalizeLlmApiFormat(nextSettings.llmApiFormat);
+  }
   if (typeof nextSettings.onboardingEligible === "boolean") {
     settings.onboardingEligible = nextSettings.onboardingEligible;
   }
@@ -404,16 +407,14 @@ async function callAutomaticLlm(config, prompt) {
   ].join("\n");
   let response = await sendAutomaticLlmRequest(config, requestPrompt, config.llmUseResponseFormat === true);
   let textValue = await response.text();
-  if (!response.ok && config.llmUseResponseFormat === true && /response[_ ]format|json_object/i.test(textValue)) {
+  if (!response.ok && config.llmUseResponseFormat === true && /response[_ ]format|text\.format|json_object/i.test(textValue)) {
     response = await sendAutomaticLlmRequest(config, requestPrompt, false);
     textValue = await response.text();
   }
   if (!response.ok) throw new Error("AI API HTTP " + response.status + ": " + textValue.slice(0, 300));
   const data = parseAutomaticJson(textValue);
-  const content = data && data.choices && data.choices[0] && data.choices[0].message
-    ? data.choices[0].message.content
-    : "";
-  if (!content) throw new Error("AI 响应缺少 choices[0].message.content");
+  const content = core.extractLlmText(data);
+  if (!content) throw new Error("AI 响应缺少可读取的文本内容");
   const parsed = parseAutomaticJson(content);
   const items = Array.isArray(parsed && parsed.items)
     ? parsed.items
@@ -425,16 +426,8 @@ async function callAutomaticLlm(config, prompt) {
 }
 
 function sendAutomaticLlmRequest(config, requestPrompt, useResponseFormat) {
-  const body = {
-    model: config.llmModel,
-    temperature: Number(config.llmTemperature) || 0,
-    messages: [
-      { role: "system", content: "你只返回严格 JSON。不要 Markdown，不要解释。" },
-      { role: "user", content: requestPrompt }
-    ]
-  };
-  if (useResponseFormat) body.response_format = { type: "json_object" };
-  return fetchWithTimeout(chatCompletionsUrl(config.llmBaseUrl), {
+  const body = core.buildLlmRequestBody(config, requestPrompt, useResponseFormat);
+  return fetchWithTimeout(core.llmApiUrl(config.llmBaseUrl, config.llmApiFormat), {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -490,9 +483,7 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 }
 
 function chatCompletionsUrl(value) {
-  const url = core.normalizeText(value).replace(/\/+$/g, "");
-  if (!url) return "";
-  return /\/chat\/completions$/i.test(url) ? url : url + "/chat/completions";
+  return core.llmApiUrl(value, core.LLM_API_FORMATS.CHAT_COMPLETIONS);
 }
 
 async function openDashboard() {

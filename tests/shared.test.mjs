@@ -46,9 +46,59 @@ function loadBackgroundHelpers() {
 test("extension version is consistent across manifests", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(core.EXTENSION_VERSION, "1.1.3");
+  const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+  assert.equal(core.EXTENSION_VERSION, "1.1.4");
   assert.equal(manifest.version, core.EXTENSION_VERSION);
   assert.equal(pkg.version, core.EXTENSION_VERSION);
+  assert.match(readme, /当前版本：1\.1\.4/);
+});
+
+test("LLM API helpers support Chat Completions and Responses formats", () => {
+  assert.equal(core.DEFAULT_SETTINGS.llmApiFormat, core.LLM_API_FORMATS.CHAT_COMPLETIONS);
+  assert.equal(
+    core.llmApiUrl("https://example.test/v1", core.LLM_API_FORMATS.RESPONSES),
+    "https://example.test/v1/responses"
+  );
+  assert.equal(
+    core.llmApiUrl("https://example.test/v1/chat/completions", core.LLM_API_FORMATS.RESPONSES),
+    "https://example.test/v1/responses"
+  );
+  assert.equal(
+    core.llmApiUrl("https://example.test/v1/responses", core.LLM_API_FORMATS.CHAT_COMPLETIONS),
+    "https://example.test/v1/chat/completions"
+  );
+
+  const responsesBody = core.buildLlmRequestBody({
+    llmApiFormat: core.LLM_API_FORMATS.RESPONSES,
+    llmModel: "test-model",
+    llmTemperature: 0.1
+  }, "返回 JSON", true);
+  assert.equal(responsesBody.model, "test-model");
+  assert.equal(responsesBody.input, "返回 JSON");
+  assert.equal(typeof responsesBody.instructions, "string");
+  assert.equal(responsesBody.text.format.type, "json_object");
+  assert.equal(Object.prototype.hasOwnProperty.call(responsesBody, "messages"), false);
+
+  const chatBody = core.buildLlmRequestBody({
+    llmApiFormat: core.LLM_API_FORMATS.CHAT_COMPLETIONS,
+    llmModel: "test-model",
+    llmTemperature: 0.1
+  }, "返回 JSON", true);
+  assert.equal(chatBody.messages[1].content, "返回 JSON");
+  assert.equal(chatBody.response_format.type, "json_object");
+});
+
+test("LLM response text extraction accepts Responses output and legacy choices", () => {
+  assert.equal(core.extractLlmText({ output_text: "{\"ok\":true}" }), "{\"ok\":true}");
+  assert.equal(core.extractLlmText({
+    output: [
+      { type: "reasoning", content: [] },
+      { type: "message", content: [{ type: "output_text", text: "{\"items\":[]}" }] }
+    ]
+  }), "{\"items\":[]}");
+  assert.equal(core.extractLlmText({
+    choices: [{ message: { content: "{\"legacy\":true}" } }]
+  }), "{\"legacy\":true}");
 });
 
 function hslHue(value) {
@@ -523,6 +573,7 @@ test("dashboard consolidates AI classification, category generation and API sett
   assert.match(dashboard, /使用 API 生成/);
   assert.match(dashboard, /手动复制 Prompt/);
   assert.match(dashboard, /测试 API/);
+  assert.match(dashboard, /llm-api-format/);
   assert.match(dashboard, /textContent: "设置API"/);
   assert.match(dashboard, /toggle-settings-panel/);
   assert.match(dashboard, /toggle-api-settings/);

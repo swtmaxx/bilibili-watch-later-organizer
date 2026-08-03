@@ -956,13 +956,20 @@
         ]),
         el("div", { className: "llm-grid" }, [
           labeledInput("API URL", "llm-base-url", settings.llmBaseUrl || "", "https://openrouter.ai/api/v1", "url"),
+          el("label", { className: "field" }, [
+            el("span", { textContent: "接口格式" }),
+            el("select", { dataset: { role: "llm-api-format" } }, [
+              el("option", { value: core.LLM_API_FORMATS.CHAT_COMPLETIONS, textContent: "Chat Completions (/v1/chat/completions)", selected: core.normalizeLlmApiFormat(settings.llmApiFormat) === core.LLM_API_FORMATS.CHAT_COMPLETIONS }),
+              el("option", { value: core.LLM_API_FORMATS.RESPONSES, textContent: "Responses (/v1/responses)", selected: core.normalizeLlmApiFormat(settings.llmApiFormat) === core.LLM_API_FORMATS.RESPONSES })
+            ])
+          ]),
           labeledInput("Model", "llm-model", settings.llmModel || "", "例如 openai/gpt-4.1-mini", "text"),
           labeledInput("API Key", "llm-api-key", settings.llmApiKey || "", "sk-...", "password"),
           labeledInput("温度", "llm-temperature", settings.llmTemperature == null ? 0.1 : settings.llmTemperature, "0.1", "number")
         ]),
         el("label", { className: "inline-check" }, [
           el("input", { type: "checkbox", checked: settings.llmUseResponseFormat === true, dataset: { role: "llm-use-response-format" } }),
-          text("请求 JSON response_format")
+          text("请求结构化 JSON 输出")
         ]),
         el("div", { className: "llm-actions" }, [
           el("button", { className: "primary", dataset: { action: "save-llm-settings" }, textContent: "保存 API 设置" }),
@@ -1526,7 +1533,7 @@
       exchange.text = event.target.value;
     } else if (event.target.dataset.role === "category-prompt-import") {
       categoryGeneration.importText = event.target.value;
-    } else if (["llm-base-url", "llm-model", "llm-api-key", "llm-temperature", "llm-use-response-format"].includes(event.target.dataset.role)) {
+    } else if (["llm-base-url", "llm-api-format", "llm-model", "llm-api-key", "llm-temperature", "llm-use-response-format"].includes(event.target.dataset.role)) {
       apiSettingsDraft = collectApiSettings();
     } else if (event.target.dataset.role === "llm-auto-classify-threshold") {
       autoApiSettingsDraft = collectAutoLlmSettings();
@@ -1792,6 +1799,8 @@
         .catch((error) => setStatus(error.message));
     } else if (role === "llm-auto-classify-mode") {
       autoApiSettingsDraft = collectAutoLlmSettings();
+    } else if (role === "llm-api-format") {
+      apiSettingsDraft = collectApiSettings();
     } else if (role === "batch-category") {
       batchCategoryId = event.target.value;
       updateBatchCategorySwatch();
@@ -2064,6 +2073,7 @@
   function collectApiSettings() {
     return {
       llmBaseUrl: valueByRole("llm-base-url"),
+      llmApiFormat: core.normalizeLlmApiFormat(valueByRole("llm-api-format")),
       llmModel: valueByRole("llm-model"),
       llmApiKey: valueByRole("llm-api-key"),
       llmTemperature: numberByRole("llm-temperature", 0.1),
@@ -2149,8 +2159,8 @@
       const textValue = await response.text();
       if (!response.ok) throw new Error("HTTP " + response.status + ": " + textValue.slice(0, 240));
       const data = parseJsonObject(textValue);
-      const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-      if (!core.normalizeText(content)) throw new Error("响应缺少 choices[0].message.content");
+      const content = core.extractLlmText(data);
+      if (!core.normalizeText(content)) throw new Error("响应缺少可读取的文本内容");
       apiTestState = { running: false, message: "测试通过。当前 API 可以正常响应；如有修改，请点击“保存 API 设置”。" };
       setStatus("API 测试通过");
     } catch (error) {
@@ -2294,8 +2304,8 @@
     const useResponseFormat = config.llmUseResponseFormat === true;
     let response = await sendLlmRequest(config, requestPrompt, useResponseFormat);
     let textValue = await response.text();
-    if (!response.ok && useResponseFormat && /response[_ ]format|json_object/i.test(textValue)) {
-      llmRun.warnings.push("当前模型不支持 json_object response_format，已自动重试普通 JSON 提示模式");
+    if (!response.ok && useResponseFormat && /response[_ ]format|text\.format|json_object/i.test(textValue)) {
+      llmRun.warnings.push("当前模型不支持结构化 JSON 输出，已自动重试普通 JSON 提示模式");
       response = await sendLlmRequest(config, requestPrompt, false);
       textValue = await response.text();
     }
@@ -2303,10 +2313,8 @@
       throw new Error("AI API HTTP " + response.status + ": " + textValue.slice(0, 300));
     }
     const data = parseJsonObject(textValue);
-    const content = data && data.choices && data.choices[0] && data.choices[0].message
-      ? data.choices[0].message.content
-      : "";
-    if (!content) throw new Error("AI 响应缺少 choices[0].message.content");
+    const content = core.extractLlmText(data);
+    if (!content) throw new Error("AI 响应缺少可读取的文本内容");
     return parseJsonObject(content);
   }
 
@@ -2320,9 +2328,9 @@
     const useResponseFormat = config.llmUseResponseFormat === true;
     let response = await sendLlmRequest(config, requestPrompt, useResponseFormat);
     let textValue = await response.text();
-    if (!response.ok && useResponseFormat && /response[_ ]format|json_object/i.test(textValue)) {
-      if (onboardingCategoryRunning) onboardingCategoryMessage = "模型不支持 json_object，正在用普通 JSON 模式重试…";
-      if (categoryGeneration.running) categoryGeneration.message = "模型不支持 json_object，正在用普通 JSON 模式重试…";
+    if (!response.ok && useResponseFormat && /response[_ ]format|text\.format|json_object/i.test(textValue)) {
+      if (onboardingCategoryRunning) onboardingCategoryMessage = "模型不支持结构化 JSON 输出，正在用普通 JSON 模式重试…";
+      if (categoryGeneration.running) categoryGeneration.message = "模型不支持结构化 JSON 输出，正在用普通 JSON 模式重试…";
       renderShell();
       response = await sendLlmRequest(config, requestPrompt, false);
       textValue = await response.text();
@@ -2331,10 +2339,8 @@
       throw new Error("AI API HTTP " + response.status + ": " + textValue.slice(0, 300));
     }
     const data = parseJsonObject(textValue);
-    const content = data && data.choices && data.choices[0] && data.choices[0].message
-      ? data.choices[0].message.content
-      : "";
-    if (!content) throw new Error("AI 响应缺少 choices[0].message.content");
+    const content = core.extractLlmText(data);
+    if (!content) throw new Error("AI 响应缺少可读取的文本内容");
     const payload = parseJsonObject(content);
     if (!Array.isArray(payload && payload.categories) || !payload.categories.length) {
       throw new Error("AI 返回中没有 categories 数组");
@@ -2343,18 +2349,8 @@
   }
 
   async function sendLlmRequest(config, requestPrompt, useResponseFormat, timeoutMs) {
-    const body = {
-      model: config.llmModel,
-      temperature: Number(config.llmTemperature) || 0,
-      messages: [
-        { role: "system", content: "你只返回严格 JSON。不要 Markdown，不要解释。" },
-        { role: "user", content: requestPrompt }
-      ]
-    };
-    if (useResponseFormat) {
-      body.response_format = { type: "json_object" };
-    }
-    return fetchWithTimeout(chatCompletionsUrl(config.llmBaseUrl), {
+    const body = core.buildLlmRequestBody(config, requestPrompt, useResponseFormat);
+    return fetchWithTimeout(core.llmApiUrl(config.llmBaseUrl, config.llmApiFormat), {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -2422,9 +2418,7 @@
   }
 
   function chatCompletionsUrl(value) {
-    const url = core.normalizeText(value).replace(/\/+$/g, "");
-    if (!url) return "";
-    return /\/chat\/completions$/i.test(url) ? url : url + "/chat/completions";
+    return core.llmApiUrl(value, core.LLM_API_FORMATS.CHAT_COMPLETIONS);
   }
 
   function toggleCategoryPrompt() {

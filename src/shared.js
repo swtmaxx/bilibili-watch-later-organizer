@@ -1,9 +1,13 @@
 (function attachBiliWatchLaterCore(root) {
   "use strict";
 
-  const EXTENSION_VERSION = "1.1.3";
+  const EXTENSION_VERSION = "1.1.4";
   const CLASSIFIER_VERSION = "manual-llm-json-v1";
   const LOCAL_CLASSIFIER_VERSION = "local-rules-v1";
+  const LLM_API_FORMATS = Object.freeze({
+    CHAT_COMPLETIONS: "chat_completions",
+    RESPONSES: "responses"
+  });
   const CLASSIFICATION_SOURCE_TYPES = Object.freeze({
     MANUAL: "manual",
     LLM: "llm",
@@ -46,6 +50,7 @@
     detailConcurrency: 3,
     detailFetchEnabled: true,
     llmBaseUrl: "https://openrouter.ai/api/v1/chat/completions",
+    llmApiFormat: LLM_API_FORMATS.CHAT_COMPLETIONS,
     llmModel: "",
     llmApiKey: "",
     llmBatchSize: 50,
@@ -140,6 +145,79 @@
     return Array.from(new Set((values || [])
       .map((value) => normalizeText(value))
       .filter(Boolean)));
+  }
+
+  function normalizeLlmApiFormat(value) {
+    return value === LLM_API_FORMATS.RESPONSES
+      ? LLM_API_FORMATS.RESPONSES
+      : LLM_API_FORMATS.CHAT_COMPLETIONS;
+  }
+
+  function llmApiUrl(value, format) {
+    const url = normalizeText(value).replace(/\/+$/g, "");
+    if (!url) return "";
+    if (normalizeLlmApiFormat(format) === LLM_API_FORMATS.RESPONSES) {
+      if (/\/responses$/i.test(url)) return url;
+      if (/\/chat\/completions$/i.test(url)) return url.replace(/\/chat\/completions$/i, "/responses");
+      return url + "/responses";
+    }
+    if (/\/chat\/completions$/i.test(url)) return url;
+    if (/\/responses$/i.test(url)) return url.replace(/\/responses$/i, "/chat/completions");
+    return url + "/chat/completions";
+  }
+
+  function buildLlmRequestBody(config, requestPrompt, useResponseFormat) {
+    const systemPrompt = "你只返回严格 JSON。不要 Markdown，不要解释。";
+    if (normalizeLlmApiFormat(config && config.llmApiFormat) === LLM_API_FORMATS.RESPONSES) {
+      const body = {
+        model: config.llmModel,
+        temperature: Number(config.llmTemperature) || 0,
+        instructions: systemPrompt,
+        input: requestPrompt
+      };
+      if (useResponseFormat) body.text = { format: { type: "json_object" } };
+      return body;
+    }
+
+    const body = {
+      model: config.llmModel,
+      temperature: Number(config.llmTemperature) || 0,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: requestPrompt }
+      ]
+    };
+    if (useResponseFormat) body.response_format = { type: "json_object" };
+    return body;
+  }
+
+  function extractLlmText(payload) {
+    if (!payload || typeof payload !== "object") return "";
+    const chatMessage = payload.choices && payload.choices[0] && payload.choices[0].message;
+    const chatText = textFromLlmContent(chatMessage && chatMessage.content);
+    if (chatText) return chatText;
+    if (typeof payload.output_text === "string" && payload.output_text.trim()) return payload.output_text;
+
+    const output = Array.isArray(payload.output)
+      ? payload.output
+      : payload.response && Array.isArray(payload.response.output)
+        ? payload.response.output
+        : [];
+    return output
+      .map((item) => textFromLlmContent(item && item.content != null ? item.content : item))
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  function textFromLlmContent(content) {
+    if (typeof content === "string") return content.trim();
+    if (Array.isArray(content)) {
+      return content.map((item) => textFromLlmContent(item)).filter(Boolean).join("\n");
+    }
+    if (content && typeof content === "object") {
+      return typeof content.text === "string" ? content.text.trim() : "";
+    }
+    return "";
   }
 
   function normalizeText(value) {
@@ -963,11 +1041,16 @@
     EXTENSION_VERSION,
     CLASSIFIER_VERSION,
     LOCAL_CLASSIFIER_VERSION,
+    LLM_API_FORMATS,
     CLASSIFICATION_SOURCE_TYPES,
     MESSAGE_TYPES,
     DEFAULT_SETTINGS,
     DEFAULT_CATEGORIES,
     normalizeText,
+    normalizeLlmApiFormat,
+    llmApiUrl,
+    buildLlmRequestBody,
+    extractLlmText,
     truncateText,
     normalizeBvid,
     extractBvid,

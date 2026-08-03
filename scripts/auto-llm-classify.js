@@ -2,12 +2,13 @@
   "use strict";
 
   const CONFIG = {
-    // OpenAI-compatible Chat Completions endpoint.
+    // OpenAI-compatible endpoint format: chat_completions or responses.
     // Examples:
     // - https://api.openai.com/v1/chat/completions
     // - https://api.deepseek.com/chat/completions
     // - https://openrouter.ai/api/v1/chat/completions
     baseUrl: "https://openrouter.ai/api/v1",
+    apiFormat: "chat_completions",
     // Paste a temporary key here only for local use. Never commit a real key.
     apiKey: "YOUR_API_KEY_HERE",
     model: "tencent/hy3:free",
@@ -81,38 +82,64 @@
     }
   }
 
-  function chatCompletionsUrl(value) {
+  function apiUrl(value, format) {
     const url = String(value || "").trim().replace(/\/+$/g, "");
     if (!url) return "";
-    return /\/chat\/completions$/i.test(url) ? url : url + "/chat/completions";
+    if (format === "responses") {
+      if (/\/responses$/i.test(url)) return url;
+      if (/\/chat\/completions$/i.test(url)) return url.replace(/\/chat\/completions$/i, "/responses");
+      return url + "/responses";
+    }
+    if (/\/chat\/completions$/i.test(url)) return url;
+    if (/\/responses$/i.test(url)) return url.replace(/\/responses$/i, "/chat/completions");
+    return url + "/chat/completions";
   }
 
-  async function callLlm(prompt, attempt) {
+  function buildRequestBody(prompt) {
+    if (CONFIG.apiFormat === "responses") {
+      const body = {
+        model: CONFIG.model,
+        temperature: CONFIG.temperature,
+        instructions: "你只返回严格 JSON。不要 Markdown，不要解释。",
+        input: prompt
+      };
+      if (CONFIG.useResponseFormat) body.text = { format: { type: "json_object" } };
+      return body;
+    }
+
     const body = {
       model: CONFIG.model,
       temperature: CONFIG.temperature,
       messages: [
-        {
-          role: "system",
-          content: "你只返回严格 JSON。不要 Markdown，不要解释。"
-        },
-        {
-          role: "user",
-          content: prompt
-        }
+        { role: "system", content: "你只返回严格 JSON。不要 Markdown，不要解释。" },
+        { role: "user", content: prompt }
       ]
     };
-    if (CONFIG.useResponseFormat) {
-      body.response_format = { type: "json_object" };
-    }
+    if (CONFIG.useResponseFormat) body.response_format = { type: "json_object" };
+    return body;
+  }
 
-    const response = await fetchWithTimeout(chatCompletionsUrl(CONFIG.baseUrl), {
+  function extractResponseText(payload) {
+    const chatMessage = payload && payload.choices && payload.choices[0] && payload.choices[0].message;
+    if (chatMessage && typeof chatMessage.content === "string") return chatMessage.content.trim();
+    if (payload && typeof payload.output_text === "string" && payload.output_text.trim()) return payload.output_text;
+    const output = payload && Array.isArray(payload.output) ? payload.output : [];
+    return output.map((item) => {
+      const content = item && item.content != null ? item.content : item;
+      if (typeof content === "string") return content.trim();
+      if (Array.isArray(content)) return content.map((part) => part && typeof part.text === "string" ? part.text.trim() : "").filter(Boolean).join("\n");
+      return content && typeof content.text === "string" ? content.text.trim() : "";
+    }).filter(Boolean).join("\n");
+  }
+
+  async function callLlm(prompt, attempt) {
+    const response = await fetchWithTimeout(apiUrl(CONFIG.baseUrl, CONFIG.apiFormat), {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "authorization": "Bearer " + CONFIG.apiKey
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(buildRequestBody(prompt))
     }, CONFIG.requestTimeoutMs);
 
     const responseText = await response.text();
@@ -121,11 +148,9 @@
     }
 
     const data = parseJsonObject(responseText);
-    const content = data && data.choices && data.choices[0] && data.choices[0].message
-      ? data.choices[0].message.content
-      : "";
+    const content = extractResponseText(data);
     if (!content) {
-      throw new Error("LLM 响应缺少 choices[0].message.content，第 " + attempt + " 次尝试");
+      throw new Error("LLM 响应缺少可读取的文本内容，第 " + attempt + " 次尝试");
     }
     return parseJsonObject(content);
   }
