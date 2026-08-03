@@ -47,10 +47,89 @@ test("extension version is consistent across manifests", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
-  assert.equal(core.EXTENSION_VERSION, "1.1.4");
+  assert.equal(core.EXTENSION_VERSION, "1.1.6");
   assert.equal(manifest.version, core.EXTENSION_VERSION);
   assert.equal(pkg.version, core.EXTENSION_VERSION);
-  assert.match(readme, /当前版本：1\.1\.4/);
+  assert.match(readme, /当前版本：1\.1\.6/);
+});
+
+test("data backup payloads are versioned and normalized", () => {
+  const background = loadBackgroundHelpers();
+  const backup = background.normalizeDataBackup(JSON.stringify({
+    format: core.DATA_BACKUP_FORMAT,
+    version: core.DATA_BACKUP_VERSION,
+    settings: { llmModel: "test-model", ignored: "value" },
+    categories: core.DEFAULT_CATEGORIES,
+    videos: [],
+    classifications: [],
+    jobs: [],
+    meta: []
+  }));
+  assert.equal(backup.settings.llmModel, "test-model");
+  assert.equal(Object.prototype.hasOwnProperty.call(backup.settings, "ignored"), false);
+  assert.equal(backup.categories.some((category) => category.id === "other.todo"), true);
+  assert.throws(() => background.normalizeDataBackup({ format: "unknown", version: 1, categories: core.DEFAULT_CATEGORIES }), /不是稍后再看整理助手/);
+});
+
+test("data backup wiring covers storage snapshots and dashboard file actions", () => {
+  const idb = readFileSync(new URL("../src/idb.js", import.meta.url), "utf8");
+  const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
+  assert.match(idb, /async function putMany\(storeName, values\)/);
+  assert.match(idb, /async function snapshot\(\)/);
+  assert.match(background, /case core\.MESSAGE_TYPES\.EXPORT_DATA/);
+  assert.match(background, /case core\.MESSAGE_TYPES\.IMPORT_DATA/);
+  assert.match(background, /core\.isManualClassification\(existing\)/);
+  assert.match(dashboard, /data-import-file/);
+  assert.match(dashboard, /new Blob\(\[JSON\.stringify\(backup, null, 2\)\]/);
+  assert.match(dashboard, /confirmLabel: "导入备份"/);
+  assert.match(css, /\.data-backup-actions/);
+});
+
+test("data backup import protects settings, newer metadata, removed videos and drafts", () => {
+  const background = loadBackgroundHelpers();
+  const normalizedSettings = background.normalizeBackupSettings({
+    detailConcurrency: -1,
+    batchSize: 1000,
+    llmTemperature: 9,
+    llmAutoClassifyMode: "invalid"
+  });
+  assert.equal(normalizedSettings.detailConcurrency, 1);
+  assert.equal(normalizedSettings.batchSize, 100);
+  assert.equal(normalizedSettings.llmTemperature, 2);
+  assert.equal(Object.prototype.hasOwnProperty.call(normalizedSettings, "llmAutoClassifyMode"), false);
+
+  const existing = core.canonicalizeVideo({
+    bvid: "BV1xx411c7mD",
+    title: "目标端较新的标题",
+    desc: "目标端较新的简介",
+    tags: ["目标标签"],
+    lastSeenAt: 200
+  }, null, { now: 200 });
+  const merged = background.mergeBackupVideos([{
+    bvid: "BV1xx411c7mD",
+    title: "旧备份标题",
+    desc: "旧备份简介",
+    tags: ["备份标签"],
+    lastSeenAt: 100
+  }], [existing]).items[0];
+  assert.equal(merged.title, "目标端较新的标题");
+  assert.equal(merged.desc, "目标端较新的简介");
+  assert.deepEqual(Array.from(merged.tags).sort(), ["目标标签", "备份标签"].sort());
+
+  const jobs = background.normalizeBackupJobs([
+    { id: "detail:removed", type: "detail", bvid: "BV1removed01", status: "running" },
+    { id: "detail:present", type: "detail", bvid: "BV1present01", status: "running" }
+  ], new Map([
+    ["BV1removed01", { presentInWatchlater: false }],
+    ["BV1present01", { presentInWatchlater: true }]
+  ]));
+  assert.equal(jobs.skipped, 1);
+  assert.equal(jobs.items[0].status, "pending");
+
+  const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
+  assert.match(dashboard, /clearDataImportDrafts\(\);[\s\S]*?updateState\(result\)/);
 });
 
 test("LLM API helpers support Chat Completions and Responses formats", () => {

@@ -7,6 +7,27 @@ const ONBOARDING_VERSION = 1;
 const AUTO_LLM_ALARM = "auto-llm-classify";
 const AUTO_LLM_CONTINUE_ALARM = "auto-llm-classify-continue";
 const AUTO_LLM_MAX_BATCHES_PER_WAKE = 2;
+const MAX_BACKUP_RECORDS = 100000;
+const BACKUP_VIDEO_METADATA_FIELDS = Object.freeze([
+  "oid",
+  "aid",
+  "title",
+  "pageUrl",
+  "upName",
+  "upMid",
+  "coverUrl",
+  "tname",
+  "tags",
+  "desc",
+  "duration",
+  "viewCount",
+  "watchProgress",
+  "isWatched",
+  "pubdate",
+  "watchlaterAddedAt",
+  "watchlaterOrder",
+  "pageParts"
+]);
 
 let detailRunPromise = null;
 let classificationRepairPromise = null;
@@ -65,6 +86,10 @@ async function handleMessage(message) {
   switch (message.type) {
     case core.MESSAGE_TYPES.GET_STATE:
       return getState();
+    case core.MESSAGE_TYPES.EXPORT_DATA:
+      return exportDataBackup();
+    case core.MESSAGE_TYPES.IMPORT_DATA:
+      return importDataBackup(message.payload);
     case core.MESSAGE_TYPES.SCAN_WATCHLATER:
       return scanWatchlater(message);
     case core.MESSAGE_TYPES.UPSERT_VIDEO_ITEMS:
@@ -528,6 +553,324 @@ async function getState() {
   return Object.assign({}, summary, config, {
     progress,
     classifySummary: getClassifySummary(summary.videos, summary.classifications)
+  });
+}
+
+async function exportDataBackup() {
+  const config = await getConfig();
+  const snapshot = await db.snapshot();
+  return {
+    format: core.DATA_BACKUP_FORMAT,
+    version: core.DATA_BACKUP_VERSION,
+    exportedAt: new Date().toISOString(),
+    extensionVersion: core.EXTENSION_VERSION,
+    settings: config.settings,
+    categories: config.categories,
+    videos: snapshot.videos,
+    classifications: snapshot.classifications,
+    jobs: snapshot.jobs,
+    meta: snapshot.meta
+  };
+}
+
+function normalizeDataBackup(payload) {
+  let parsed = payload;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch (error) {
+      throw new Error("数据备份 JSON 无法解析：" + error.message);
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("数据备份必须是 JSON 对象");
+  }
+  if (parsed.format !== core.DATA_BACKUP_FORMAT) {
+    throw new Error("不是稍后再看整理助手的数据备份文件");
+  }
+  if (Number(parsed.version) !== core.DATA_BACKUP_VERSION) {
+    throw new Error("不支持的数据备份版本：" + (parsed.version == null ? "未知" : parsed.version));
+  }
+  if (!Array.isArray(parsed.categories) || !parsed.categories.length) {
+    throw new Error("数据备份中缺少分类目录");
+  }
+
+  return {
+    settings: normalizeBackupSettings(parsed.settings),
+    categories: normalizeImportedCategories({ categories: parsed.categories }, { allowSmall: true, ensureFallback: true }),
+    videos: normalizeBackupArray(parsed.videos, "videos"),
+    classifications: normalizeBackupArray(parsed.classifications, "classifications"),
+    jobs: normalizeBackupArray(parsed.jobs, "jobs"),
+    meta: normalizeBackupArray(parsed.meta, "meta")
+  };
+}
+
+function normalizeBackupSettings(settings) {
+  if (settings == null) return {};
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    throw new Error("数据备份中的设置格式不正确");
+  }
+  const normalized = {};
+  const has = (key) => Object.prototype.hasOwnProperty.call(settings, key);
+  const copyString = (key, maxLength) => {
+    if (has(key)) normalized[key] = core.truncateText(settings[key], maxLength);
+  };
+  const copyNumber = (key, minimum, maximum, integer) => {
+    if (!has(key)) return;
+    const value = Number(settings[key]);
+    if (!Number.isFinite(value)) return;
+    const bounded = Math.min(maximum, Math.max(minimum, value));
+    normalized[key] = integer ? Math.floor(bounded) : bounded;
+  };
+  const copyBoolean = (key) => {
+    if (typeof settings[key] === "boolean") normalized[key] = settings[key];
+  };
+
+  if (["watchlater", "pubdate", "duration"].includes(settings.sortMode)) normalized.sortMode = settings.sortMode;
+  if (["asc", "desc"].includes(settings.sortDirection)) normalized.sortDirection = settings.sortDirection;
+  copyNumber("batchSize", 20, 100, true);
+  copyNumber("manualExportLimit", 0, 500, true);
+  copyNumber("detailConcurrency", 1, 6, true);
+  copyNumber("llmBatchSize", 1, 100, true);
+  copyNumber("llmLimit", 0, 10000, false);
+  copyNumber("llmTemperature", 0, 2, false);
+  copyNumber("llmAutoClassifyThreshold", 1, 10000, true);
+  copyNumber("llmAutoClassifyLastRunAt", 0, Number.MAX_SAFE_INTEGER, false);
+  copyNumber("llmAutoClassifyLastImported", 0, MAX_BACKUP_RECORDS, true);
+  copyNumber("onboardingVersion", 0, 100, true);
+  copyNumber("categoryListUpdatedAt", 0, Number.MAX_SAFE_INTEGER, false);
+  copyBoolean("detailFetchEnabled");
+  copyBoolean("llmIncludeAll");
+  copyBoolean("llmUseResponseFormat");
+
+  if (typeof settings.llmApiFormat === "string") normalized.llmApiFormat = core.normalizeLlmApiFormat(settings.llmApiFormat);
+  if (["off", "daily", "weekly", "threshold"].includes(settings.llmAutoClassifyMode)) normalized.llmAutoClassifyMode = settings.llmAutoClassifyMode;
+  if (["", "categories", "api", "prompt"].includes(settings.onboardingMethod)) normalized.onboardingMethod = settings.onboardingMethod;
+  if (["login", "setup", "setup-categories", "setup-api", "setup-prompt", "setup-result", "guide", "classify", "complete"].includes(settings.onboardingStage)) normalized.onboardingStage = settings.onboardingStage;
+  copyBoolean("onboardingEligible");
+  copyBoolean("onboardingCompleted");
+  copyString("llmBaseUrl", 2048);
+  copyString("llmModel", 200);
+  copyString("llmApiKey", 4096);
+  copyString("llmAutoClassifyLastStatus", 500);
+  copyString("categoryListSource", 80);
+  copyString("classificationRepairVersion", 80);
+  return normalized;
+}
+
+function normalizeBackupArray(value, name) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new Error("数据备份中的 " + name + " 必须是数组");
+  if (value.length > MAX_BACKUP_RECORDS) throw new Error("数据备份中的 " + name + " 数量过多");
+  return value;
+}
+
+function backupTimestamp(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function backupValueIsUseful(value) {
+  if (value == null) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "string") return core.normalizeText(value) !== "";
+  return true;
+}
+
+function mergeBackupVideos(importedVideos, existingVideos) {
+  const existingByBvid = new Map((existingVideos || []).map((video) => [video.bvid, video]));
+  const mergedByBvid = new Map(existingByBvid);
+  let imported = 0;
+  let skipped = 0;
+
+  (importedVideos || []).forEach((item) => {
+    const bvid = core.normalizeBvid(item && (item.bvid || item.pageUrl));
+    if (!bvid) {
+      skipped += 1;
+      return;
+    }
+    try {
+      const existing = existingByBvid.get(bvid);
+      const incomingLastSeen = backupTimestamp(item.lastSeenAt, 0);
+      const existingLastSeen = backupTimestamp(existing && existing.lastSeenAt, 0);
+      const incoming = Object.assign({}, item, { bvid });
+      if (existing) {
+        ["tags", "pageParts"].forEach((field) => {
+          if (Array.isArray(existing[field]) || Array.isArray(incoming[field])) {
+            const existingValues = Array.isArray(existing[field]) ? existing[field] : [];
+            const incomingValues = Array.isArray(incoming[field]) ? incoming[field] : [];
+            incoming[field] = core.uniqueStrings(existingValues.concat(incomingValues));
+          }
+        });
+        if (existingLastSeen > incomingLastSeen) {
+          BACKUP_VIDEO_METADATA_FIELDS.forEach((field) => {
+            if (["tags", "pageParts"].includes(field)) return;
+            if (backupValueIsUseful(existing[field])) incoming[field] = existing[field];
+          });
+        }
+      }
+      const now = incomingLastSeen || existingLastSeen || Date.now();
+      const merged = core.canonicalizeVideo(incoming, existing, { now });
+      const incomingFirstSeen = backupTimestamp(incoming.firstSeenAt, now);
+      const mergedLastSeen = backupTimestamp(incoming.lastSeenAt, now);
+      merged.firstSeenAt = existing && existing.firstSeenAt
+        ? Math.min(existing.firstSeenAt, incomingFirstSeen)
+        : incomingFirstSeen;
+      merged.lastSeenAt = existing && existing.lastSeenAt
+        ? Math.max(existing.lastSeenAt, mergedLastSeen)
+        : mergedLastSeen;
+      merged.presentInWatchlater = existing
+        ? existing.presentInWatchlater !== false || incoming.presentInWatchlater !== false
+        : incoming.presentInWatchlater !== false;
+      merged.sourceHash = core.computeSourceHash(merged);
+      mergedByBvid.set(bvid, merged);
+      imported += 1;
+    } catch (error) {
+      skipped += 1;
+    }
+  });
+
+  return { items: Array.from(mergedByBvid.values()), imported, skipped };
+}
+
+function normalizeBackupJobs(jobs, videosByBvid) {
+  const normalized = [];
+  let skipped = 0;
+  (jobs || []).forEach((job) => {
+    const id = core.normalizeText(job && job.id);
+    if (!id) {
+      skipped += 1;
+      return;
+    }
+    const type = core.normalizeText(job.type) || "detail";
+    const bvid = core.normalizeBvid(job.bvid) || "";
+    const video = bvid && videosByBvid ? videosByBvid.get(bvid) : null;
+    if (type === "detail" && bvid && (!video || video.presentInWatchlater === false)) {
+      skipped += 1;
+      return;
+    }
+    const status = ["pending", "running", "done", "failed"].includes(job.status) ? job.status : "pending";
+    normalized.push({
+      id,
+      type,
+      bvid,
+      reason: core.truncateText(job.reason, 160),
+      status: status === "running" ? "pending" : status,
+      attempts: Math.max(0, Number(job.attempts) || 0),
+      createdAt: backupTimestamp(job.createdAt, Date.now()),
+      updatedAt: backupTimestamp(job.updatedAt, Date.now()),
+      error: core.truncateText(job.error, 240)
+    });
+  });
+  return { items: normalized, skipped };
+}
+
+function normalizeBackupMeta(meta) {
+  const normalized = [];
+  let skipped = 0;
+  (meta || []).forEach((item) => {
+    const key = core.normalizeText(item && item.key);
+    if (!key) {
+      skipped += 1;
+      return;
+    }
+    normalized.push({ key, value: item.value });
+  });
+  return { items: normalized, skipped };
+}
+
+async function importDataBackup(payload) {
+  const backup = normalizeDataBackup(payload);
+  const config = await getConfig();
+  const current = await db.snapshot();
+  const videoResult = mergeBackupVideos(backup.videos, current.videos);
+  const classificationsByBvid = new Map((current.classifications || []).map((item) => [item.bvid, item]));
+  const categories = preserveManualCategoryDefinitions(backup.categories, config.categories, current.classifications);
+  const parsed = core.parseClassificationPayload({ classifications: backup.classifications });
+  const validated = core.validateClassificationItems(parsed.items, categories, videoResult.items);
+  const rawClassificationsByBvid = new Map((backup.classifications || [])
+    .map((item) => [core.normalizeBvid(item && item.bvid), item])
+    .filter(([bvid]) => Boolean(bvid)));
+  const videosByBvid = new Map(videoResult.items.map((video) => [video.bvid, video]));
+  let importedClassifications = 0;
+  let skippedClassifications = 0;
+  const classificationUpdates = new Map();
+
+  validated.items.forEach((item) => {
+    const video = videosByBvid.get(item.bvid);
+    if (!video) {
+      skippedClassifications += 1;
+      return;
+    }
+    const existing = classificationUpdates.get(item.bvid) || classificationsByBvid.get(item.bvid);
+    if (existing && core.isManualClassification(existing)) {
+      skippedClassifications += 1;
+      return;
+    }
+    const raw = rawClassificationsByBvid.get(item.bvid) || {};
+    const incoming = Object.assign({}, item, {
+      sourceType: core.classificationSourceType(raw) || item.sourceType,
+      manualOverride: Boolean(raw.manualOverride) || core.classificationSourceType(raw) === core.CLASSIFICATION_SOURCE_TYPES.MANUAL,
+      classifierVersion: core.normalizeText(raw.classifierVersion) || item.classifierVersion,
+      sourceHashAtClassification: core.normalizeText(raw.sourceHashAtClassification)
+    });
+    const classifiedAt = backupTimestamp(raw.classifiedAt, Date.now());
+    const merged = core.mergeClassification(existing, incoming, video, { now: classifiedAt });
+    if (merged.skippedImport) {
+      skippedClassifications += 1;
+      return;
+    }
+    classificationUpdates.set(item.bvid, Object.assign({}, merged, { classifiedAt }));
+    importedClassifications += 1;
+  });
+
+  const importedSettings = Object.assign({}, core.DEFAULT_SETTINGS, normalizeBackupSettings(Object.assign({}, config.settings, backup.settings)), {
+    categoryListUpdatedAt: Date.now(),
+    categoryListSource: "backup"
+  });
+  await chromeStorageSet({ settings: importedSettings, categories });
+  await db.putMany("videos", videoResult.items);
+  await db.putMany("classifications", Array.from(classificationUpdates.values()));
+
+  const jobResult = normalizeBackupJobs(backup.jobs, videosByBvid);
+  const metaResult = normalizeBackupMeta(backup.meta);
+  const staleDetailJobs = (current.jobs || []).filter((job) => {
+    if (core.normalizeText(job && job.type) !== "detail") return false;
+    const video = videosByBvid.get(core.normalizeBvid(job && job.bvid));
+    return Boolean(video && video.presentInWatchlater === false);
+  });
+  for (const job of staleDetailJobs) await db.remove("jobs", job.id);
+  await db.putMany("jobs", jobResult.items);
+  await db.putMany("meta", metaResult.items);
+  await cleanupDeletedCategoryReferences(new Set(config.categories.map((category) => category.id)
+    .filter((id) => !categories.some((category) => category.id === id))), categories);
+  await configureAutoLlmAlarm(importedSettings, true);
+
+  const warnings = [...parsed.warnings, ...validated.warnings];
+  if (videoResult.skipped) warnings.push("有 " + videoResult.skipped + " 个视频记录无法导入");
+  if (jobResult.skipped) warnings.push("有 " + jobResult.skipped + " 个处理任务无法导入");
+  if (staleDetailJobs.length) warnings.push("已清理 " + staleDetailJobs.length + " 个已移除视频的详情任务");
+  if (metaResult.skipped) warnings.push("有 " + metaResult.skipped + " 个扩展元数据无法导入");
+  if (skippedClassifications) warnings.push("有 " + skippedClassifications + " 项视频分类被跳过，其中可能包含已有手动确认");
+  setProgress({
+    status: "idle",
+    message: "数据备份导入完成：更新 " + videoResult.imported + " 个视频，导入 " + importedClassifications + " 项分类",
+    pending: 0,
+    running: 0,
+    updatedAt: Date.now()
+  });
+  return Object.assign(await getState(), {
+    dataImportResult: {
+      videos: videoResult.imported,
+      skippedVideos: videoResult.skipped,
+      classifications: importedClassifications,
+      skippedClassifications,
+      categories: categories.length,
+      jobs: jobResult.items.length,
+      removedJobs: staleDetailJobs.length,
+      meta: metaResult.items.length,
+      warnings: warnings.slice(0, 100)
+    }
   });
 }
 

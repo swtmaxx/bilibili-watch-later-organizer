@@ -1,7 +1,9 @@
 (function attachBiliWatchLaterCore(root) {
   "use strict";
 
-  const EXTENSION_VERSION = "1.1.4";
+  const EXTENSION_VERSION = "1.1.6";
+  const DATA_BACKUP_FORMAT = "bili-watchlater-organizer-backup";
+  const DATA_BACKUP_VERSION = 1;
   const CLASSIFIER_VERSION = "manual-llm-json-v1";
   const LOCAL_CLASSIFIER_VERSION = "local-rules-v1";
   const LLM_API_FORMATS = Object.freeze({
@@ -16,6 +18,8 @@
 
   const MESSAGE_TYPES = Object.freeze({
     GET_STATE: "GET_STATE",
+    EXPORT_DATA: "EXPORT_DATA",
+    IMPORT_DATA: "IMPORT_DATA",
     SCAN_WATCHLATER: "SCAN_WATCHLATER",
     UPSERT_VIDEO_ITEMS: "UPSERT_VIDEO_ITEMS",
     FETCH_VIDEO_DETAILS: "FETCH_VIDEO_DETAILS",
@@ -1039,6 +1043,8 @@
 
   const api = Object.freeze({
     EXTENSION_VERSION,
+    DATA_BACKUP_FORMAT,
+    DATA_BACKUP_VERSION,
     CLASSIFIER_VERSION,
     LOCAL_CLASSIFIER_VERSION,
     LLM_API_FORMATS,

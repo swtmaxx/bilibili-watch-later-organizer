@@ -74,6 +74,17 @@
     return value;
   }
 
+  async function putMany(storeName, values) {
+    const items = Array.isArray(values) ? values.filter(Boolean) : [];
+    if (!items.length) return 0;
+    const db = await openDB();
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    items.forEach((value) => store.put(value));
+    await txDone(tx);
+    return items.length;
+  }
+
   async function remove(storeName, key) {
     const db = await openDB();
     const tx = db.transaction(storeName, "readwrite");
@@ -186,6 +197,11 @@
     return { videos, classifications, jobs };
   }
 
+  async function snapshot() {
+    const summaryResult = await summary();
+    return Object.assign(summaryResult, { meta: await getAll("meta") });
+  }
+
   root.BiliWLDB = Object.freeze({
     DB_NAME,
     DB_VERSION,
@@ -193,6 +209,7 @@
     get,
     getAll,
     put,
+    putMany,
     remove,
     clear,
     upsertVideos,
@@ -203,6 +220,7 @@
     queueJobs,
     updateJob,
     pendingJobs,
-    summary
+    summary,
+    snapshot
   });
 })(typeof globalThis !== "undefined" ? globalThis : window);

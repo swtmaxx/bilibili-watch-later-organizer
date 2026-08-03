@@ -38,6 +38,7 @@
   let apiSettingsDraft = null;
   let autoApiSettingsDraft = null;
   let apiTestState = { running: false, message: "" };
+  let dataBackupState = { running: false, message: "" };
   let categoryGeneration = { mode: "", running: false, loading: false, prompt: "", importText: "", message: "" };
   let syncAnimations = { added: new Set(), changed: new Set() };
   let syncAnimationTimer = 0;
@@ -938,7 +939,8 @@
       ]),
       el("div", { className: "fold-body settings-body" + (settingsPanelOpen ? "" : " hidden") }, [
         renderApiSettingsSection(),
-        renderAutoLlmSettingsSection()
+        renderAutoLlmSettingsSection(),
+        renderDataBackup()
       ])
     ]);
   }
@@ -1008,6 +1010,24 @@
           el("button", { className: "primary", dataset: { action: "save-auto-llm-settings" }, textContent: "保存自动分类设置" })
         ])
       ])
+    ]);
+  }
+
+  function renderDataBackup() {
+    return el("section", { className: "settings-subfold data-backup", dataset: { fold: "data-backup" } }, [
+      el("div", { className: "settings-subhead data-backup-heading" }, [
+        el("h3", { textContent: "数据备份" })
+      ]),
+      el("div", { className: "settings-subbody" }, [
+        el("p", { className: "settings-help", textContent: "导出分类目录、视频信息、视频分类和设置，方便迁移到另一份扩展数据。导入会合并视频记录，现有手动确认不会被覆盖。" }),
+        el("p", { className: "settings-warning", textContent: "备份文件包含 API Key，请妥善保管，不要上传到公开位置。" }),
+        el("div", { className: "data-backup-actions" }, [
+          el("button", { className: "primary", dataset: { action: "export-data" }, textContent: dataBackupState.running ? "正在导出…" : "导出本地数据" }),
+          el("button", { className: "ghost", dataset: { action: "choose-data-import" }, textContent: "选择备份文件" }),
+          el("input", { className: "data-backup-file", type: "file", accept: ".json,application/json", dataset: { role: "data-import-file" }, style: "display:none;" })
+        ]),
+        dataBackupState.message ? el("div", { className: "data-backup-status", textContent: dataBackupState.message }) : null
+      ].filter(Boolean))
     ]);
   }
 
@@ -1107,6 +1127,11 @@
       saveAutoLlmSettings();
     } else if (action === "test-llm-api") {
       testLlmApi();
+    } else if (action === "export-data") {
+      exportDataBackup();
+    } else if (action === "choose-data-import") {
+      const input = nodeByRole("data-import-file");
+      if (input) input.click();
     } else if (action === "open-api-settings") {
       openApiSettings("请在“设置”中填写、保存并测试 API");
     } else if (action === "start-llm-run") {
@@ -1778,7 +1803,9 @@
 
   function onChange(event) {
     const role = event.target.dataset.role;
-    if (role === "sort-combo") {
+    if (role === "data-import-file") {
+      importDataBackupFile(event.target);
+    } else if (role === "sort-combo") {
       const parsed = parseSortCombo(event.target.value);
       send({ type: message.UPDATE_SETTINGS, settings: parsed })
         .then(updateState)
@@ -2068,6 +2095,83 @@
     } catch (error) {
       setStatus("导入失败：" + error.message);
     }
+  }
+
+  async function exportDataBackup() {
+    if (dataBackupState.running) return;
+    dataBackupState = { running: true, message: "正在准备数据备份…" };
+    renderEditorOnly();
+    try {
+      const backup = await send({ type: message.EXPORT_DATA });
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const stamp = new Date().toISOString().replace(/[T:]/g, "-").replace(/\.\d{3}Z$/, "Z");
+      link.href = url;
+      link.download = "bilibili-watch-later-backup-" + stamp + ".json";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      dataBackupState = { running: false, message: "数据备份已下载" };
+      setStatus("数据备份已导出");
+    } catch (error) {
+      dataBackupState = { running: false, message: "导出失败：" + error.message };
+      setStatus("数据备份导出失败：" + error.message);
+    }
+    renderEditorOnly();
+  }
+
+  async function importDataBackupFile(input) {
+    const file = input && input.files && input.files[0];
+    if (input) input.value = "";
+    if (!file) return;
+
+    dataBackupState = { running: true, message: "正在读取备份文件…" };
+    renderEditorOnly();
+    try {
+      const raw = await file.text();
+      const payload = JSON.parse(raw);
+      const videoCount = Array.isArray(payload.videos) ? payload.videos.length : 0;
+      const classificationCount = Array.isArray(payload.classifications) ? payload.classifications.length : 0;
+      const categoryCount = Array.isArray(payload.categories) ? payload.categories.length : 0;
+      const confirmed = await confirmAction({
+        title: "导入本地数据？",
+        message: "将处理 " + videoCount + " 个视频、" + classificationCount + " 项视频分类和 " + categoryCount + " 个分类目录。现有手动确认不会被覆盖，备份中的设置（包括 API Key）也会写入本地。",
+        confirmLabel: "导入备份"
+      });
+      if (!confirmed) {
+        dataBackupState = { running: false, message: "已取消导入" };
+        renderEditorOnly();
+        return;
+      }
+
+      dataBackupState = { running: true, message: "正在导入本地数据…" };
+      renderEditorOnly();
+      const result = await send({ type: message.IMPORT_DATA, payload: raw });
+      const imported = result.dataImportResult || {};
+      dataBackupState = {
+        running: false,
+        message: "已导入 " + (imported.videos || 0) + " 个视频和 " + (imported.classifications || 0) + " 项分类" + (imported.skippedClassifications ? "，跳过 " + imported.skippedClassifications + " 项" : "")
+      };
+      clearDataImportDrafts();
+      updateState(result);
+      setStatus(dataBackupState.message + (imported.warnings && imported.warnings.length ? "；有部分记录被跳过" : ""));
+    } catch (error) {
+      dataBackupState = { running: false, message: "导入失败：" + error.message };
+      setStatus("数据备份导入失败：" + error.message);
+      renderEditorOnly();
+    }
+  }
+
+  function clearDataImportDrafts() {
+    categoryDraft = null;
+    categoryDraftDirty = false;
+    apiSettingsDraft = null;
+    autoApiSettingsDraft = null;
+    categoryGeneration = { mode: "", running: false, loading: false, prompt: "", importText: "", message: "" };
+    exchange = { visible: false, title: "", text: "", append: exchange.append, mode: "import" };
+    apiTestState = { running: false, message: "" };
   }
 
   function collectApiSettings() {
