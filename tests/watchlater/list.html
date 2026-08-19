@@ -59,9 +59,6 @@
             .concat([{ bvid: payload.bvid, categoryIds: payload.categoryIds, confidence: 1, manualOverride: true, classifiedAt: Date.now(), classifierVersion: "manual" }]);
           return { ok: true, data: mockState };
         }
-        if (payload.type === core.MESSAGE_TYPES.EXPORT_CLASSIFY_BATCH) {
-          return { ok: true, data: { prompt: "mock prompt", batchSize: 2, countRemaining: 2, mergeMode: payload.mergeMode || "replace" } };
-        }
         return { ok: true, data: mockState };
       }
     }

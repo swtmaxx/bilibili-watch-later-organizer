@@ -1,23 +1,9 @@
-import { readFileSync } from "node:fs";
-
-const source = readFileSync(new URL("./auto-llm-classify.js", import.meta.url), "utf8");
-
-function readConfigString(name) {
-  const match = source.match(new RegExp(name + ":\\s*([\"'`])([\\s\\S]*?)\\1"));
-  return match ? match[2].trim() : "";
-}
-
-function readConfigNumber(name, fallback) {
-  const match = source.match(new RegExp(name + ":\\s*([0-9.]+)"));
-  return match ? Number(match[1]) : fallback;
-}
-
-const baseUrl = readConfigString("baseUrl");
-const apiFormat = readConfigString("apiFormat") || "chat_completions";
-const apiKey = readConfigString("apiKey");
-const model = readConfigString("model");
-const temperature = readConfigNumber("temperature", 0);
-const useResponseFormat = /useResponseFormat:\s*true/.test(source);
+const baseUrl = process.env.LLM_BASE_URL || "https://openrouter.ai/api/v1";
+const apiFormat = process.env.LLM_API_FORMAT || "chat_completions";
+const apiKey = process.env.LLM_API_KEY || "";
+const model = process.env.LLM_MODEL || "";
+const temperature = Number(process.env.LLM_TEMPERATURE || 0);
+const useResponseFormat = process.env.LLM_USE_RESPONSE_FORMAT === "true";
 
 function apiUrl(value, format) {
   const url = String(value || "").trim().replace(/\/+$/g, "");
@@ -32,9 +18,8 @@ function apiUrl(value, format) {
   return url + "/chat/completions";
 }
 
-if (!baseUrl) throw new Error("auto-llm-classify.js missing CONFIG.baseUrl");
-if (!apiKey || apiKey === "YOUR_API_KEY_HERE") throw new Error("auto-llm-classify.js missing CONFIG.apiKey");
-if (!model) throw new Error("auto-llm-classify.js missing CONFIG.model");
+if (!apiKey) throw new Error("LLM_API_KEY is required");
+if (!model) throw new Error("LLM_MODEL is required");
 
 const endpoint = apiUrl(baseUrl, apiFormat);
 const requestBody = apiFormat === "responses"

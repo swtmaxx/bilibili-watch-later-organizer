@@ -1,7 +1,7 @@
 (function attachBiliWatchLaterCore(root) {
   "use strict";
 
-  const EXTENSION_VERSION = "1.1.6";
+  const EXTENSION_VERSION = "1.1.28";
   const DATA_BACKUP_FORMAT = "bili-watchlater-organizer-backup";
   const DATA_BACKUP_VERSION = 1;
   const CLASSIFIER_VERSION = "manual-llm-json-v1";
@@ -15,6 +15,33 @@
     LLM: "llm",
     KEYWORD: "keyword"
   });
+  const BROWSE_MODES = Object.freeze({
+    CATEGORIES: "categories",
+    UP: "up"
+  });
+  const VIDEO_VIEW_MODES = Object.freeze({
+    CARDS: "cards",
+    LIST: "list"
+  });
+  const UNKNOWN_UP_GROUP_KEY = "unknown";
+  const UNKNOWN_UP_NAME = "未知 UP 主";
+  const SINGLE_VIDEO_UP_GROUP_KEY = "single-video-ups";
+  const SINGLE_VIDEO_UP_GROUP_NAME = "单视频 UP 主";
+  const DURATION_FILTER_PRESETS = Object.freeze({
+    ALL: "all",
+    UNKNOWN: "unknown",
+    UNDER_10: "under_10",
+    FROM_10_TO_30: "from_10_to_30",
+    FROM_30_TO_60: "from_30_to_60",
+    OVER_60: "over_60",
+    CUSTOM: "custom"
+  });
+  const WATCH_PROGRESS_FILTER_PRESETS = Object.freeze({
+    ALL: "all",
+    NOT_STARTED: "not_started",
+    IN_PROGRESS: "in_progress",
+    COMPLETED: "completed"
+  });
 
   const MESSAGE_TYPES = Object.freeze({
     GET_STATE: "GET_STATE",
@@ -25,18 +52,19 @@
     FETCH_VIDEO_DETAILS: "FETCH_VIDEO_DETAILS",
     EXPORT_CATEGORY_PROPOSAL: "EXPORT_CATEGORY_PROPOSAL",
     IMPORT_CATEGORIES: "IMPORT_CATEGORIES",
-    EXPORT_CLASSIFY_BATCH: "EXPORT_CLASSIFY_BATCH",
-    IMPORT_CLASSIFICATIONS: "IMPORT_CLASSIFICATIONS",
+    EXPORT_AI_CLASSIFY_BATCH: "EXPORT_AI_CLASSIFY_BATCH",
+    IMPORT_AI_CLASSIFICATIONS: "IMPORT_AI_CLASSIFICATIONS",
     AUTO_CLASSIFY: "AUTO_CLASSIFY",
     CHECK_BILI_LOGIN: "CHECK_BILI_LOGIN",
     SYNC_ON_OPEN: "SYNC_ON_OPEN",
-    RESET_FOR_LLM_RECLASSIFY: "RESET_FOR_LLM_RECLASSIFY",
+    CHECK_AUTO_LLM: "CHECK_AUTO_LLM",
     APPLY_FILTER: "APPLY_FILTER",
     JOB_PROGRESS: "JOB_PROGRESS",
     SAVE_MANUAL_CLASSIFICATION: "SAVE_MANUAL_CLASSIFICATION",
     BULK_UPDATE_CLASSIFICATIONS: "BULK_UPDATE_CLASSIFICATIONS",
+    CREATE_FAVORITE_FOLDER_AND_ADD: "CREATE_FAVORITE_FOLDER_AND_ADD",
     REMOVE_FROM_WATCHLATER: "REMOVE_FROM_WATCHLATER",
-    REMOVE_FROM_WATCHLATER_PAGE: "REMOVE_FROM_WATCHLATER_PAGE",
+    BULK_REMOVE_FROM_WATCHLATER: "BULK_REMOVE_FROM_WATCHLATER",
     UPDATE_SETTINGS: "UPDATE_SETTINGS",
     OPEN_DASHBOARD: "OPEN_DASHBOARD",
     ADD_CATEGORY: "ADD_CATEGORY",
@@ -47,12 +75,15 @@
   });
 
   const DEFAULT_SETTINGS = Object.freeze({
+    browseMode: BROWSE_MODES.CATEGORIES,
+    videoViewMode: VIDEO_VIEW_MODES.CARDS,
+    collapsedCategoryIds: [],
     sortMode: "watchlater",
     sortDirection: "desc",
     batchSize: 80,
-    manualExportLimit: 80,
     detailConcurrency: 3,
     detailFetchEnabled: true,
+    categorySampleLimit: 60,
     llmBaseUrl: "https://openrouter.ai/api/v1/chat/completions",
     llmApiFormat: LLM_API_FORMATS.CHAT_COMPLETIONS,
     llmModel: "",
@@ -232,6 +263,68 @@
       .trim();
   }
 
+  function normalizeBrowseMode(value) {
+    return value === BROWSE_MODES.UP ? BROWSE_MODES.UP : BROWSE_MODES.CATEGORIES;
+  }
+
+  function normalizeVideoViewMode(value) {
+    return value === VIDEO_VIEW_MODES.LIST ? VIDEO_VIEW_MODES.LIST : VIDEO_VIEW_MODES.CARDS;
+  }
+
+  function normalizeCollapsedCategoryIds(value) {
+    return Array.from(new Set((Array.isArray(value) ? value : [])
+      .filter((item) => typeof item === "string")
+      .map((item) => normalizeText(item))
+      .filter(Boolean)));
+  }
+
+  function upGroupKey(video) {
+    const mid = toNumberOrUndefined(video && video.upMid);
+    if (Number.isFinite(mid) && mid > 0) return "mid:" + String(Math.trunc(mid));
+    const name = normalizeText(video && video.upName);
+    return name ? "name:" + name : UNKNOWN_UP_GROUP_KEY;
+  }
+
+  function browseUpGroupKey(video, videos) {
+    const identityKey = upGroupKey(video);
+    if (identityKey === UNKNOWN_UP_GROUP_KEY || !Array.isArray(videos)) return identityKey;
+    const count = videos.filter((item) => item && item.presentInWatchlater !== false && upGroupKey(item) === identityKey).length;
+    return count === 1 ? SINGLE_VIDEO_UP_GROUP_KEY : identityKey;
+  }
+
+  function upGroupName(video) {
+    return normalizeText(video && video.upName) || UNKNOWN_UP_NAME;
+  }
+
+  function upGroups(videos) {
+    const present = (videos || []).filter((video) => video && video.presentInWatchlater !== false);
+    const identityCounts = new Map();
+    present.forEach((video) => {
+      const identityKey = upGroupKey(video);
+      identityCounts.set(identityKey, (identityCounts.get(identityKey) || 0) + 1);
+    });
+    const groups = new Map();
+    present.forEach((video) => {
+      const identityKey = upGroupKey(video);
+      const key = identityKey !== UNKNOWN_UP_GROUP_KEY && identityCounts.get(identityKey) === 1
+        ? SINGLE_VIDEO_UP_GROUP_KEY
+        : identityKey;
+      const name = key === SINGLE_VIDEO_UP_GROUP_KEY ? SINGLE_VIDEO_UP_GROUP_NAME : upGroupName(video);
+      const existing = groups.get(key);
+      if (existing) {
+        existing.count += 1;
+        if (existing.name === UNKNOWN_UP_NAME && name !== UNKNOWN_UP_NAME) existing.name = name;
+        return;
+      }
+      groups.set(key, { key, name, count: 1 });
+    });
+    return Array.from(groups.values()).sort((a, b) =>
+      b.count - a.count ||
+      a.name.localeCompare(b.name, "zh-CN") ||
+      a.key.localeCompare(b.key)
+    );
+  }
+
   function truncateText(value, maxLength) {
     const text = normalizeText(value);
     if (!maxLength || text.length <= maxLength) return text;
@@ -342,6 +435,12 @@
     merged.desc = pickUseful(normalizeText(input && input.desc), merged.desc);
     merged.duration = pickUseful(toNumberOrUndefined(input && input.duration), merged.duration);
     merged.viewCount = pickUseful(toNumberOrUndefined(input && input.viewCount), merged.viewCount);
+    merged.danmakuCount = pickUseful(toNumberOrUndefined(input && input.danmakuCount), merged.danmakuCount);
+    merged.likeCount = pickUseful(toNumberOrUndefined(input && input.likeCount), merged.likeCount);
+    merged.coinCount = pickUseful(toNumberOrUndefined(input && input.coinCount), merged.coinCount);
+    merged.favoriteCount = pickUseful(toNumberOrUndefined(input && input.favoriteCount), merged.favoriteCount);
+    merged.shareCount = pickUseful(toNumberOrUndefined(input && input.shareCount), merged.shareCount);
+    merged.replyCount = pickUseful(toNumberOrUndefined(input && input.replyCount), merged.replyCount);
     const incomingProgress = toNumberOrUndefined(input && input.watchProgress);
     const incomingWatched = input && typeof input.isWatched === "boolean" ? input.isWatched : undefined;
     if (incomingProgress != null) {
@@ -420,6 +519,65 @@
       counts[stage] += 1;
     });
     return counts;
+  }
+
+  function normalizeDurationFilterPreset(value) {
+    const normalized = normalizeText(value);
+    return Object.values(DURATION_FILTER_PRESETS).includes(normalized)
+      ? normalized
+      : DURATION_FILTER_PRESETS.ALL;
+  }
+
+  function durationFilterBound(value) {
+    if (value == null || String(value).trim() === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+  }
+
+  function durationFilterMatches(video, filter) {
+    const preset = normalizeDurationFilterPreset(filter && filter.durationPreset);
+    if (preset === DURATION_FILTER_PRESETS.ALL) return true;
+
+    const duration = Number(video && video.duration);
+    const hasDuration = Number.isFinite(duration) && duration > 0;
+    if (preset === DURATION_FILTER_PRESETS.UNKNOWN) return !hasDuration;
+    if (!hasDuration) return false;
+    if (preset === DURATION_FILTER_PRESETS.UNDER_10) return duration < 10 * 60;
+    if (preset === DURATION_FILTER_PRESETS.FROM_10_TO_30) return duration >= 10 * 60 && duration < 30 * 60;
+    if (preset === DURATION_FILTER_PRESETS.FROM_30_TO_60) return duration >= 30 * 60 && duration < 60 * 60;
+    if (preset === DURATION_FILTER_PRESETS.OVER_60) return duration >= 60 * 60;
+    if (preset !== DURATION_FILTER_PRESETS.CUSTOM) return true;
+
+    const minimum = durationFilterBound(filter && filter.durationMin);
+    const maximum = durationFilterBound(filter && filter.durationMax);
+    if (minimum != null && maximum != null && minimum > maximum) return false;
+    if (minimum != null && duration < minimum * 60) return false;
+    if (maximum != null && duration > maximum * 60) return false;
+    return true;
+  }
+
+  function normalizeWatchProgressFilterPreset(value) {
+    const normalized = normalizeText(value);
+    return Object.values(WATCH_PROGRESS_FILTER_PRESETS).includes(normalized)
+      ? normalized
+      : WATCH_PROGRESS_FILTER_PRESETS.ALL;
+  }
+
+  function watchProgressFilterMatches(video, filter) {
+    const preset = normalizeWatchProgressFilterPreset(filter && filter.watchProgressPreset);
+    if (preset === WATCH_PROGRESS_FILTER_PRESETS.ALL) return true;
+
+    const duration = Number(video && video.duration);
+    if (!Number.isFinite(duration) || duration <= 0) return false;
+
+    const progress = Number(video && video.watchProgress);
+    const hasProgress = Number.isFinite(progress);
+    const watchedToEnd = video && video.isWatched === true
+      || hasProgress && (progress < 0 || progress >= duration);
+    if (preset === WATCH_PROGRESS_FILTER_PRESETS.COMPLETED) return watchedToEnd;
+    if (preset === WATCH_PROGRESS_FILTER_PRESETS.NOT_STARTED) return !watchedToEnd && (!hasProgress || progress <= 0);
+    if (preset === WATCH_PROGRESS_FILTER_PRESETS.IN_PROGRESS) return !watchedToEnd && hasProgress && progress > 0 && progress < duration;
+    return true;
   }
 
   function classifyStatus(video, classification) {
@@ -515,13 +673,20 @@
     return { items, warnings };
   }
 
-  function validateClassificationItems(items, categories, videos) {
+  function validateClassificationItems(items, categories, videos, options) {
     const categoryIds = new Set((categories || []).filter((item) => item.enabled !== false).map((item) => item.id));
     const videoIds = new Set((videos || []).map((video) => video.bvid));
+    const expectedBvids = new Set(uniqueStrings(Array.isArray(options && options.expectedBvids) ? options.expectedBvids : [])
+      .map((bvid) => normalizeBvid(bvid))
+      .filter(Boolean));
     const warnings = [];
     const validItems = [];
 
     (items || []).forEach((item) => {
+      if (expectedBvids.size && !expectedBvids.has(item.bvid)) {
+        warnings.push(item.bvid + " 不属于当前 AI 批次，已跳过");
+        return;
+      }
       if (!videoIds.has(item.bvid)) {
         warnings.push(item.bvid + " 不在本地稍后再看记录中，已跳过");
         return;
@@ -555,12 +720,20 @@
     return names.join("/");
   }
 
-  function flattenCategoryLines(categories) {
+  function flattenCategoryLines(categories, options) {
+    const settings = options || {};
     const byId = new Map((categories || []).map((category) => [category.id, category]));
     return (categories || [])
       .filter((category) => category.enabled !== false)
       .sort((a, b) => categoryPath(a, byId).localeCompare(categoryPath(b, byId)))
-      .map((category) => "- " + category.id + " = " + categoryPath(category, byId));
+      .map((category) => {
+        const path = categoryPath(category, byId);
+        if (!settings.includeKeywords) return "- " + category.id + " = " + path;
+        const keywords = uniqueStrings(category.keywords)
+          .slice(0, 10)
+          .map((keyword) => truncateText(keyword, 40));
+        return "- " + category.id + " = " + path + (keywords.length ? "；关键词：" + keywords.join("、") : "");
+      });
   }
 
   function categoryById(categories) {
@@ -986,8 +1159,8 @@
       settings.titleOnly
         ? "为缩短首次提示词，本批只提供标题；信息不足时使用 other.todo。"
         : "如果标题像标题党，请优先参考 UP主、B站分区、简介、标签、分P标题。",
-      "只能使用下面的 category id：",
-      flattenCategoryLines(categories).join("\n"),
+      "下面每行包含分类 id、完整层级路径和可选关键词。关键词用于理解分类边界；只能使用下面的 category id：",
+      flattenCategoryLines(categories, { includeKeywords: true }).join("\n"),
       "",
       "请返回严格 JSON，不要 Markdown，不要解释。格式：",
       "{\"items\":[{\"bvid\":\"BV...\",\"categoryIds\":[\"tech.ai.llm\"],\"confidence\":0.86,\"reason\":\"一句话原因\"}]}",
@@ -997,15 +1170,31 @@
     ].join("\n");
   }
 
+  function normalizeCategorySampleLimit(value, fallback) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 1) return Math.floor(number);
+    const fallbackNumber = Number(fallback);
+    return Number.isFinite(fallbackNumber) && fallbackNumber >= 1 ? Math.floor(fallbackNumber) : 60;
+  }
+
   function buildCategoryProposalPrompt(videos, categories, options) {
     const settings = Object.assign({ sampleLimit: 60 }, options || {});
-    const titles = (videos || [])
-      .slice(0, Math.max(1, Number(settings.sampleLimit) || 60))
-      .map((video) => truncateText(video && video.title, 100))
-      .filter(Boolean);
+    const sampleLimit = normalizeCategorySampleLimit(settings.sampleLimit, 60);
+    const rows = (videos || [])
+      .slice(0, sampleLimit)
+      .map((video) => ({
+        title: truncateText(video && video.title, 120),
+        upName: truncateText(video && video.upName, 40),
+        tname: truncateText(video && video.tname, 30),
+        tags: uniqueStrings(video && video.tags).slice(0, 12),
+        desc: truncateText(video && video.desc, 280),
+        duration: toNumberOrUndefined(video && video.duration) || 0,
+        pageParts: uniqueStrings(video && video.pageParts).slice(0, 8)
+      }));
     return [
       "你是一个 B站稍后再看分类目录设计助手。你的任务是生成并替换可选分类目录，不是给每个视频分配分类。",
-      "请根据样本标题设计一套适合这个用户长期使用的通用分类树，并用它取代当前默认分类目录。",
+      "请根据样本视频信息设计一套适合这个用户长期使用的通用分类树，并用它取代当前默认分类目录。",
+      "每个样本包含 title（标题）、upName（UP主）、tname（B站分区）、tags（标签）、desc（简介）、duration（时长，单位为秒）和 pageParts（分P标题）；字段可能为空。",
       "",
       "要求：",
       "1. 建议 4-8 个一级分类，最多三级，总数控制在 15-45 个。",
@@ -1021,15 +1210,20 @@
       "当前分类目录（仅供参考，可以整体替换）：",
       flattenCategoryLines(categories || []).join("\n"),
       "",
-      "现有稍后再看视频标题样本：",
-      JSON.stringify(titles)
+      "现有稍后再看视频信息样本：",
+      JSON.stringify(rows, null, settings.compact ? 0 : 2)
     ].join("\n");
   }
 
-  function matchesFilter(video, classification, filter) {
+  function matchesFilter(video, classification, filter, videos) {
     const settings = filter || {};
     if (!video) return false;
     if (video.presentInWatchlater === false && !settings.includeRemoved) return false;
+    if (!durationFilterMatches(video, settings)) return false;
+    if (!watchProgressFilterMatches(video, settings)) return false;
+
+    const upGroupKeyValue = normalizeText(settings.upGroupKey);
+    if (upGroupKeyValue && browseUpGroupKey(video, videos) !== upGroupKeyValue) return false;
 
     const categoryIds = new Set(settings.categoryIds || []);
     const hasCategoryFilter = categoryIds.size > 0;
@@ -1049,10 +1243,30 @@
     LOCAL_CLASSIFIER_VERSION,
     LLM_API_FORMATS,
     CLASSIFICATION_SOURCE_TYPES,
+    BROWSE_MODES,
+    VIDEO_VIEW_MODES,
+    DURATION_FILTER_PRESETS,
+    WATCH_PROGRESS_FILTER_PRESETS,
+    UNKNOWN_UP_GROUP_KEY,
+    UNKNOWN_UP_NAME,
+    SINGLE_VIDEO_UP_GROUP_KEY,
+    SINGLE_VIDEO_UP_GROUP_NAME,
     MESSAGE_TYPES,
     DEFAULT_SETTINGS,
     DEFAULT_CATEGORIES,
+    normalizeCategorySampleLimit,
     normalizeText,
+    normalizeBrowseMode,
+    normalizeVideoViewMode,
+    normalizeCollapsedCategoryIds,
+    normalizeDurationFilterPreset,
+    durationFilterMatches,
+    normalizeWatchProgressFilterPreset,
+    watchProgressFilterMatches,
+    upGroupKey,
+    browseUpGroupKey,
+    upGroupName,
+    upGroups,
     normalizeLlmApiFormat,
     llmApiUrl,
     buildLlmRequestBody,

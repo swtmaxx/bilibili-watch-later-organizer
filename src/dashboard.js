@@ -13,13 +13,22 @@
     classifySummary: null,
     progress: null
   };
-  let activeFilter = { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" };
+  let activeFilter = {
+    categoryIds: [],
+    includeUnclassified: false,
+    includeRemoved: false,
+    sourceCategoryId: "",
+    upGroupKey: "",
+    watchProgressPreset: core.WATCH_PROGRESS_FILTER_PRESETS.ALL,
+    durationPreset: core.DURATION_FILTER_PRESETS.ALL,
+    durationMin: "",
+    durationMax: ""
+  };
   let searchText = "";
   let selectedBvid = "";
   let categoryAdminOpen = false;
   let categoryDraft = null;
   let categoryDraftDirty = false;
-  let exchange = { visible: false, title: "", text: "", append: false, mode: "import" };
   let savedCategoryScrollTop = 0;
   let draggedCategoryId = "";
   let dragDropPosition = "before";
@@ -27,6 +36,9 @@
   let batchMode = false;
   let selectedBvids = new Set();
   let batchCategoryId = "";
+  let favoriteFolderTitle = "";
+  let favoriteRun = { running: false, result: null, message: "" };
+  let bulkRemoveRun = { running: false, result: null, message: "", failed: false };
   let selectionBox = null;
   let suppressNextCardClick = false;
   let llmRun = { running: false, stopRequested: false, done: false, imported: 0, skipped: 0, processed: 0, total: 0, message: "" };
@@ -39,7 +51,7 @@
   let autoApiSettingsDraft = null;
   let apiTestState = { running: false, message: "" };
   let dataBackupState = { running: false, message: "" };
-  let categoryGeneration = { mode: "", running: false, loading: false, prompt: "", importText: "", message: "" };
+  let categoryGeneration = { running: false, message: "" };
   let syncAnimations = { added: new Set(), changed: new Set() };
   let syncAnimationTimer = 0;
   let idleDetailTimer = 0;
@@ -47,13 +59,15 @@
   let onboardingCheckingLogin = false;
   let onboardingLoginStatus = "unknown";
   let onboardingPanelDismissed = false;
-  let onboardingPromptText = "";
-  let onboardingPromptLoading = false;
   let onboardingCategoryRunning = false;
   let onboardingCategoryMessage = "";
   let savedMainScrollTop = 0;
   let savedEditorScrollTop = 0;
   let statusNotice = { text: "", kind: "info" };
+  let videoViewSaveQueue = Promise.resolve();
+  let videoViewChangeId = 0;
+  let categoryCollapseSaveQueue = Promise.resolve();
+  let categoryCollapseChangeId = 0;
   const IDLE_DETAIL_DELAY_MS = 12000;
   const IDLE_DETAIL_INTERVAL_MS = 30 * 60 * 1000;
 
@@ -91,6 +105,7 @@
     } else {
       onboardingCheckingLogin = false;
       await syncOnOpen();
+      await checkAutoLlmOnRefresh();
     }
   }
 
@@ -113,9 +128,6 @@
         return;
       }
       await syncOnOpen();
-      if (onboardingStage() === "setup-prompt" && !onboardingPromptText) {
-        await loadOnboardingPrompt();
-      }
     } catch (error) {
       onboardingCheckingLogin = false;
       onboardingLoginStatus = "unknown";
@@ -290,12 +302,11 @@
       content = [
         el("div", { className: "onboarding-kicker", textContent: "首次使用 · 2 / 3" }),
         el("h2", { textContent: "先设置你的分类目录" }),
-        el("p", { textContent: "这里调整的是所有视频共用的分类目录，不是在给视频分配类别。默认目录不一定适合你，可以手动修改，也可以让 AI 根据现有视频重新生成。" }),
+        el("p", { textContent: "这里调整的是所有视频共用的分类目录，不是在给视频分配类别。默认目录不一定适合你，可以手动修改，也可以让 AI 根据现有视频的标题、UP主、分区、标签、简介、分P标题和时长重新生成。" }),
         renderOnboardingCategoryPreview("当前分类目录"),
         el("div", { className: "onboarding-options" }, [
           onboardingOption("categories", "1", "我要手动设置我的分类", "收起引导卡片并展开右侧的编辑分类目录，直接修改可选分类。"),
-          onboardingOption("api", "2", "我有 API，让 AI 帮我调整分类", "填写 API 后，AI 会根据现有视频自动生成并替换分类目录。"),
-          onboardingOption("prompt", "3", "我没有 API，手动复制 Prompt 来生成分类目录", "复制分类目录 Prompt 给 AI，再把 categories JSON 导回插件。")
+          onboardingOption("api", "2", "我有 API，让 AI 帮我调整分类", "填写 API 后，AI 会根据现有视频的信息自动生成并替换分类目录。")
         ]),
         el("div", { className: "onboarding-note", textContent: "完成这一阶段后，第三步才会开始给每一个视频分配类别。" })
       ];
@@ -305,7 +316,8 @@
       content = [
         el("div", { className: "onboarding-kicker", textContent: "首次使用 · 2 / 3 · API" }),
         el("h2", { textContent: "让 AI 生成分类目录" }),
-        el("p", { textContent: "分类目录生成和 AI 批量视频分类共用同一组 API 设置。生成目录本身不会给每个视频分类。" }),
+        el("p", { textContent: "分类目录生成和 AI 批量视频分类共用同一组 API 设置。AI 会参考现有视频的标题、UP主、分区、标签、简介、分P标题和时长；生成目录本身不会给每个视频分类。" }),
+        renderCategorySampleLimitSetting(),
         el("div", { className: "onboarding-api-state " + (configured ? "ready" : "missing"), textContent: configured ? "API 已设置，可以先测试，或直接生成分类目录。" : "API 尚未设置完整，请先到右侧“设置”中填写并测试。" }),
         onboardingCategoryMessage ? el("div", { className: "onboarding-run-status", textContent: onboardingCategoryMessage }) : null,
         el("div", { className: "onboarding-actions" }, [
@@ -314,33 +326,11 @@
           configured ? el("button", { className: "primary", dataset: { action: "save-onboarding-api" }, textContent: onboardingCategoryRunning ? "AI 正在生成分类目录…" : "让 AI 生成分类目录" }) : null
         ])
       ].filter(Boolean);
-    } else if (stage === "setup-prompt") {
-      content = [
-        el("div", { className: "onboarding-kicker", textContent: "首次使用 · 2 / 3 · Prompt" }),
-        el("h2", { textContent: "手动让 AI 生成分类目录" }),
-        el("p", { textContent: "Prompt 会随机抽取现有视频标题，请 AI 设计一棵新的分类目录；生成目录本身不会给每个视频分类。" }),
-        el("label", { className: "field onboarding-prompt-field" }, [
-          el("span", { textContent: onboardingPromptLoading ? "正在生成分类目录 Prompt…" : "复制给 ChatGPT / Gemini" }),
-          el("textarea", { readonly: "", dataset: { role: "onboarding-prompt-text" }, value: onboardingPromptText, placeholder: "正在生成精简 Prompt..." })
-        ]),
-        el("div", { className: "onboarding-inline-actions" }, [
-          el("button", { dataset: { action: "copy-onboarding-prompt" }, textContent: "复制 Prompt" }),
-          el("button", { className: "ghost", dataset: { action: "regenerate-onboarding-prompt" }, textContent: "重新随机生成" })
-        ]),
-        el("label", { className: "field onboarding-prompt-field" }, [
-          el("span", { textContent: "粘贴 AI 返回的 categories JSON" }),
-          el("textarea", { dataset: { role: "onboarding-prompt-import" }, placeholder: "{\"categories\":[{\"id\":\"study\",\"name\":\"学习\",...}]}" })
-        ]),
-        el("div", { className: "onboarding-actions" }, [
-          el("button", { className: "ghost", dataset: { action: "back-onboarding-setup" }, textContent: "← 返回上一步" }),
-          el("button", { className: "primary", dataset: { action: "import-onboarding-json" }, textContent: "导入并替换分类目录" })
-        ])
-      ];
     } else if (stage === "setup-result") {
       content = [
         el("div", { className: "onboarding-kicker", textContent: "首次使用 · 2 / 3 · 已更新" }),
         el("h2", { textContent: "新的分类目录已生成" }),
-        el("p", { textContent: "下面是 AI 根据现有视频生成的新分类目录。它已经取代默认目录，并附带 keywords 供后续初步分类使用。还需要手动调整吗？" }),
+        el("p", { textContent: "下面是 AI 根据现有视频信息生成的新分类目录。它已经取代默认目录，并附带 keywords 供后续初步分类使用。还需要手动调整吗？" }),
         renderOnboardingCategoryPreview("新的分类目录"),
         el("div", { className: "onboarding-actions" }, [
           el("button", { className: "ghost", dataset: { action: "back-onboarding-method" }, textContent: "← 返回上一步" }),
@@ -371,7 +361,6 @@
         ]),
         el("div", { className: "onboarding-actions onboarding-actions-wide" }, [
           el("button", { className: "primary", dataset: { action: "start-onboarding-classify", mode: "manual" }, textContent: "手动调整一个视频分类" }),
-          el("button", { dataset: { action: "start-onboarding-classify", mode: "prompt" }, textContent: "启动 AI (手动导入/导出) 批量视频分类" }),
           el("button", { dataset: { action: "start-onboarding-classify", mode: "api" }, textContent: "启动 AI (API) 批量视频分类" })
         ]),
         el("button", { className: "onboarding-back", dataset: { action: "back-onboarding-setup" }, textContent: "← 返回上一步" }),
@@ -447,10 +436,39 @@
     return el("aside", { className: "sidebar" }, [
       el("div", { className: "side-head" }, [
         el("h1", { textContent: "稍后再看整理助手" }),
-        el("div", { className: "sub", textContent: "自动归类，快速找到想看的视频" })
+        el("div", { className: "sub", textContent: "自动归类，快速找到想看的视频" }),
+        renderBrowseModeSwitch()
       ]),
-      renderCategoryTree()
+      browseMode() === core.BROWSE_MODES.UP ? renderUpTree() : renderCategoryTree()
     ]);
+  }
+
+  function renderBrowseModeSwitch() {
+    const current = browseMode();
+    return el("div", { className: "browse-mode-switch", role: "group", "aria-label": "浏览模式" }, [
+      el("button", {
+        className: "browse-mode-button" + (current === core.BROWSE_MODES.CATEGORIES ? " active" : ""),
+        type: "button",
+        "aria-pressed": current === core.BROWSE_MODES.CATEGORIES,
+        dataset: { action: "set-browse-mode", mode: core.BROWSE_MODES.CATEGORIES },
+        textContent: "按分类目录"
+      }),
+      el("button", {
+        className: "browse-mode-button" + (current === core.BROWSE_MODES.UP ? " active" : ""),
+        type: "button",
+        "aria-pressed": current === core.BROWSE_MODES.UP,
+        dataset: { action: "set-browse-mode", mode: core.BROWSE_MODES.UP },
+        textContent: "按 UP 主"
+      })
+    ]);
+  }
+
+  function browseMode() {
+    return core.normalizeBrowseMode(state.settings && state.settings.browseMode);
+  }
+
+  function videoViewMode() {
+    return core.normalizeVideoViewMode(state.settings && state.settings.videoViewMode);
   }
 
   function renderStats() {
@@ -502,7 +520,7 @@
     const counts = categoryCounts();
     const fragment = document.createDocumentFragment();
     fragment.appendChild(el("button", {
-      className: "cat-row" + (!activeFilter.categoryIds.length && !activeFilter.includeUnclassified ? " active" : ""),
+      className: "cat-row" + (!activeFilter.categoryIds.length && !activeFilter.includeUnclassified && !activeFilter.upGroupKey ? " active" : ""),
       dataset: { action: "filter-all" }
     }, [
       el("span", { className: "cat-name", textContent: "全部视频" }),
@@ -519,8 +537,41 @@
     return el("nav", { className: "cat-nav" }, [fragment]);
   }
 
+  function renderUpTree() {
+    const groups = core.upGroups(presentVideos());
+    const counts = categoryCounts();
+    const fragment = document.createDocumentFragment();
+    fragment.appendChild(el("button", {
+      className: "cat-row" + (!activeFilter.categoryIds.length && !activeFilter.includeUnclassified && !activeFilter.upGroupKey ? " active" : ""),
+      dataset: { action: "filter-all" }
+    }, [
+      el("span", { className: "cat-name", textContent: "全部视频" }),
+      el("span", { className: "cat-count", textContent: String(presentVideos().length) })
+    ]));
+    fragment.appendChild(el("button", {
+      className: "cat-row" + (activeFilter.includeUnclassified ? " active" : ""),
+      dataset: { action: "filter-unclassified" }
+    }, [
+      el("span", { className: "cat-name", textContent: "待精细分类" }),
+      el("span", { className: "cat-count", textContent: String(counts.unclassified) })
+    ]));
+    groups.forEach((group) => {
+      fragment.appendChild(el("button", {
+        className: "cat-row up-group-row" + (activeFilter.upGroupKey === group.key ? " active" : ""),
+        dataset: { action: "filter-up", upGroupKey: group.key }
+      }, [
+        el("span", { className: "cat-name", textContent: group.name }),
+        el("span", { className: "cat-count", textContent: String(group.count) })
+      ]));
+    });
+    return el("nav", { className: "cat-nav up-nav" }, [fragment]);
+  }
+
   function appendCategoryLevel(fragment, parentId, level, counts) {
     core.childrenOf(state.categories, parentId).forEach((category) => {
+      const children = core.childrenOf(state.categories, category.id);
+      const canCollapse = level === 0 && children.length > 0;
+      const collapsed = canCollapse && isCategoryCollapsed(category.id);
       const expanded = expandCategoryIds([category.id]);
       const active = activeFilter.sourceCategoryId === category.id || expanded.length && expanded.every((id) => activeFilter.categoryIds.includes(id));
       const group = el("div", {
@@ -529,17 +580,32 @@
         title: "拖动可调整同级顺序；此分类及全部子分类会一起移动",
         dataset: { categoryGroup: category.id }
       }, [
-        el("button", {
-          className: "cat-row category-draggable indent-" + Math.min(level, 3) + (active ? " active" : ""),
-          style: categoryStyle(category, "row"),
-          dataset: { action: "filter-category", categoryId: category.id }
+        el("div", {
+          className: "category-row-layout indent-" + Math.min(level, 3) + (canCollapse ? " has-collapse-toggle" : "")
         }, [
-          el("span", { className: "category-drag-handle", title: "拖动分类及其子分类", "aria-hidden": "true", textContent: "⋮⋮" }),
-          el("span", { className: "cat-name", textContent: category.name }),
-          el("span", { className: "cat-count", textContent: String(counts.byCategory.get(category.id) || 0) })
+          el("button", {
+            className: "cat-row category-draggable" + (active ? " active" : ""),
+            type: "button",
+            style: categoryStyle(category, "row"),
+            dataset: { action: "filter-category", categoryId: category.id }
+          }, [
+            el("span", { className: "category-drag-handle", title: "拖动分类及其子分类", "aria-hidden": "true", textContent: "⋮⋮" }),
+            el("span", { className: "cat-name", textContent: category.name }),
+            el("span", { className: "cat-count", textContent: String(counts.byCategory.get(category.id) || 0) })
+          ]),
+          canCollapse ? el("button", {
+            className: "category-collapse-toggle" + (collapsed ? " is-collapsed" : ""),
+            type: "button",
+            draggable: false,
+            style: categoryStyle(category, "row"),
+            title: (collapsed ? "展开" : "折叠") + "“" + category.name + "”的子分类",
+            "aria-label": (collapsed ? "展开" : "折叠") + "“" + category.name + "”的子分类",
+            "aria-expanded": !collapsed,
+            dataset: { action: "toggle-category-collapse", categoryId: category.id }
+          }, [iconNode(collapsed ? "chevron-right" : "chevron-down")]) : null
         ])
       ]);
-      appendCategoryLevel(group, category.id, level + 1, counts);
+      if (!collapsed) appendCategoryLevel(group, category.id, level + 1, counts);
       fragment.appendChild(group);
     });
   }
@@ -579,40 +645,33 @@
     return el("div", { className: "category-generation" }, [
       el("div", { className: "category-generation-heading" }, [
         el("h3", { textContent: "让 AI 生成分类目录" }),
-        el("p", { textContent: "AI 会根据现有视频设计并替换可选分类目录，不会给已有视频重新分类，也不会覆盖手动确认。" })
+        el("p", { textContent: "AI 会参考现有视频的标题、UP主、分区、标签、简介、分P标题和时长，设计并替换可选分类目录；不会给已有视频重新分类，也不会覆盖手动确认。" })
       ]),
+      renderCategorySampleLimitSetting(),
       el("div", { className: "category-generation-actions" }, [
         el("button", {
           className: "primary",
           dataset: { action: "generate-categories-api" },
           textContent: categoryGeneration.running ? "AI 正在生成…" : "使用 API 生成"
         }),
-        el("button", {
-          dataset: { action: "toggle-category-prompt" },
-          textContent: categoryGeneration.mode === "prompt" ? "收起手动复制" : "手动复制 Prompt"
-        }),
         el("button", { className: "ghost", dataset: { action: "open-api-settings" }, textContent: "设置API" })
       ]),
-      categoryGeneration.message ? el("div", { className: "category-generation-status", textContent: categoryGeneration.message }) : null,
-      categoryGeneration.mode === "prompt" ? renderCategoryPromptEditor() : null
+      categoryGeneration.message ? el("div", { className: "category-generation-status", textContent: categoryGeneration.message }) : null
     ].filter(Boolean));
   }
 
-  function renderCategoryPromptEditor() {
-    return el("div", { className: "category-prompt-editor" }, [
-      el("label", { className: "field" }, [
-        el("span", { textContent: categoryGeneration.loading ? "正在生成分类目录 Prompt…" : "复制给 ChatGPT / Gemini" }),
-        el("textarea", { readonly: "", dataset: { role: "category-prompt-text" }, value: categoryGeneration.prompt, placeholder: "点击下方按钮生成 Prompt" })
-      ]),
-      el("div", { className: "category-generation-actions" }, [
-        el("button", { dataset: { action: "load-category-prompt" }, textContent: categoryGeneration.prompt ? "重新生成 Prompt" : "生成 Prompt" }),
-        el("button", { className: "ghost", dataset: { action: "copy-category-prompt" }, textContent: "复制 Prompt" })
-      ]),
-      el("label", { className: "field" }, [
-        el("span", { textContent: "粘贴 AI 返回的 categories JSON" }),
-        el("textarea", { dataset: { role: "category-prompt-import" }, value: categoryGeneration.importText, placeholder: "{\"categories\":[{\"id\":\"study\",\"name\":\"学习\",...}]}" })
-      ]),
-      el("button", { className: "primary category-import-button", dataset: { action: "import-category-prompt" }, textContent: "导入并替换分类目录" })
+  function renderCategorySampleLimitSetting() {
+    const settings = state.settings || {};
+    return el("label", { className: "field category-sample-setting" }, [
+      el("span", { textContent: "分类目录样本数量" }),
+      el("input", {
+        type: "number",
+        min: "1",
+        step: "1",
+        value: settings.categorySampleLimit == null ? core.DEFAULT_SETTINGS.categorySampleLimit : settings.categorySampleLimit,
+        placeholder: "60",
+        dataset: { role: "category-sample-limit" }
+      })
     ]);
   }
 
@@ -621,13 +680,16 @@
       el("div", { className: "topbar" }, [
         el("input", { className: "search-input", type: "search", value: searchText, placeholder: "搜索标题、UP主、分区、标签、BV号", dataset: { role: "search" } }),
         el("div", { className: "toolbar" }, [
+          renderWatchProgressFilter(),
+          renderDurationFilter(),
           el("select", { title: "排序", dataset: { role: "sort-combo" } }, sortOptions()),
           el("button", { className: "primary", title: "先同步列表，再排队更新缺失详情", dataset: { action: "sync-refresh" }, textContent: "同步并更新" }),
           toolbarIconButton("open-bili-home", "B站主页", "bilibili"),
           toolbarIconButton("open-watchlater", "稍后再看", "watchlater"),
           toolbarIconButton("open-bili-dynamic", "B站动态", "dynamic")
         ]),
-        batchMode ? renderBatchPanel() : null
+        batchMode ? renderBatchPanel() : null,
+        batchMode ? renderFavoriteFolderPanel() : null
       ]),
       renderContent(visible)
     ]);
@@ -637,12 +699,37 @@
     return el("div", { className: "content", dataset: { role: "content" } }, [
       renderBatchSelectionBox(),
       el("div", { className: "list-head" }, [
-        el("span", { textContent: "当前显示 " + visible.length + " / " + presentVideos().length + " 个" }),
-        el("span", { textContent: activeFilterLabel() })
+        el("div", { className: "list-head-copy" }, [
+          el("span", { textContent: "当前显示 " + visible.length + " / " + presentVideos().length + " 个" }),
+          el("span", { textContent: activeFilterLabel() })
+        ]),
+        renderViewSwitch()
       ]),
       visible.length
-        ? el("div", { className: "grid" }, visible.map(renderVideoCard))
+        ? el("div", { className: "grid video-grid view-" + videoViewMode() }, visible.map(renderVideoCard))
         : el("div", { className: "empty", textContent: "没有匹配的视频。可以清除筛选或先在 B站页面扫描同步。" })
+    ]);
+  }
+
+  function renderViewSwitch() {
+    const current = videoViewMode();
+    return el("div", { className: "view-switch", role: "group", "aria-label": "视频视图" }, [
+      viewSwitchButton(core.VIDEO_VIEW_MODES.CARDS, current === core.VIDEO_VIEW_MODES.CARDS, "卡片视图", "grid"),
+      viewSwitchButton(core.VIDEO_VIEW_MODES.LIST, current === core.VIDEO_VIEW_MODES.LIST, "列表视图", "list")
+    ]);
+  }
+
+  function viewSwitchButton(mode, active, label, icon) {
+    return el("button", {
+      className: "view-switch-button" + (active ? " active" : ""),
+      type: "button",
+      title: label,
+      "aria-label": label,
+      "aria-pressed": active,
+      dataset: { action: "set-video-view", mode }
+    }, [
+      iconNode(icon),
+      el("span", { textContent: label.replace("视图", "") })
     ]);
   }
 
@@ -672,8 +759,11 @@
         el("div", { className: "title", textContent: video.title || video.bvid }),
         el("div", { className: "meta", textContent: [video.upName, video.tname].filter(Boolean).join(" · ") || video.bvid }),
         el("div", { className: "meta", textContent: [formatDate(video.pubdate), formatWatchlaterDate(video.watchlaterAddedAt)].filter(Boolean).join(" · ") }),
+        renderMetricStats(video),
         el("div", { className: "badges" }, [
-          ...(sourceType ? [el("span", { className: "badge source source-" + sourceType, textContent: sourceLabel(sourceType) })] : []),
+          ...(sourceType && sourceType !== core.CLASSIFICATION_SOURCE_TYPES.LLM
+            ? [el("span", { className: "badge source source-" + sourceType, textContent: sourceLabel(sourceType) })]
+            : []),
           ...(["unclassified", "stale", "low_confidence"].includes(status) ? [el("span", { className: "badge warn", textContent: statusLabel(status) })] : []),
           ...(categoryBadgeNodes(classification).length ? categoryBadgeNodes(classification) : [el("span", { className: "badge warn", textContent: "分类异常" })]).slice(0, 4)
         ]),
@@ -695,6 +785,7 @@
     const categoryRows = flattenCategoriesInTree();
     const selectedCategory = categoryRows.find(({ category }) => category.id === batchCategoryId) || categoryRows[0];
     if (selectedCategory) batchCategoryId = selectedCategory.category.id;
+    const batchOperationRunning = favoriteRun.running || bulkRemoveRun.running;
     return el("section", { className: "batch-panel" }, [
       el("div", { className: "batch-panel-summary" }, [
         el("div", {}, [
@@ -707,7 +798,15 @@
         ]),
         el("div", { className: "batch-actions" }, [
           el("button", { dataset: { action: "batch-select-all" }, textContent: "全选当前结果" }),
-          el("button", { className: "ghost", dataset: { action: "batch-clear-selection" }, textContent: "清空选择" })
+          el("button", { className: "ghost", dataset: { action: "batch-clear-selection" }, textContent: "清空选择" }),
+          el("button", {
+            className: "danger batch-remove-watchlater",
+            type: "button",
+            disabled: batchOperationRunning || !selectedBvids.size,
+            title: "将选中视频从 B站稍后再看移出，但保留本地分类记录",
+            dataset: { action: "bulk-remove-watchlater" },
+            textContent: bulkRemoveRun.running ? "正在批量移出…" : "批量移出稍后再看"
+          })
         ])
       ]),
       el("div", { className: "batch-form" }, [
@@ -729,8 +828,64 @@
         ]),
         el("button", { className: "primary", dataset: { action: "batch-add-category" }, textContent: "添加分类到选中视频" }),
         el("button", { className: "danger", dataset: { action: "batch-clear-categories" }, textContent: "清除选中视频中所有现有分类" })
-      ])
-    ]);
+      ]),
+      bulkRemoveRun.message
+        ? el("div", {
+          className: "batch-remove-result" + (bulkRemoveRun.failed || bulkRemoveRun.result && bulkRemoveRun.result.failed ? " has-failures" : ""),
+          role: "status",
+          "aria-live": "polite",
+          textContent: bulkRemoveRun.message
+        })
+        : null
+    ].filter(Boolean));
+  }
+
+  function renderFavoriteFolderPanel() {
+    if (!batchMode) return el("div", { className: "favorite-panel hidden" });
+    const hasTitle = Boolean(core.normalizeText(favoriteFolderTitle));
+    const canSubmit = !favoriteRun.running && selectedBvids.size > 0 && hasTitle;
+    return el("section", { className: "favorite-panel" }, [
+      el("div", { className: "favorite-panel-summary" }, [
+        el("div", {}, [
+          el("h3", { textContent: "新建收藏夹" }),
+          el("div", {
+            className: "batch-count",
+            dataset: { role: "favorite-panel-count" },
+            textContent: "当前选择 " + selectedBvids.size + " 个视频"
+          })
+        ]),
+        el("span", { className: "favorite-privacy", textContent: "默认私密" })
+      ]),
+      el("div", { className: "favorite-form" }, [
+        el("label", { className: "field" }, [
+          el("span", { textContent: "收藏夹名称" }),
+          el("input", {
+            type: "text",
+            value: favoriteFolderTitle,
+            maxlength: "50",
+            placeholder: "例如：待看课程",
+            dataset: { role: "favorite-folder-title" }
+          })
+        ]),
+        el("button", {
+          className: "primary",
+          type: "button",
+          disabled: !canSubmit,
+          dataset: { action: "create-favorite-folder" },
+          textContent: favoriteRun.running ? "正在创建并加入…" : "新建收藏夹并加入"
+        })
+      ]),
+      el("div", {
+        className: "favorite-note",
+        textContent: "将当前选择的视频加入新建的 B站私密收藏夹；缺少视频编号或接口失败的项目会在完成后汇总。"
+      }),
+      favoriteRun.message
+        ? el("div", {
+          className: "favorite-result" + (favoriteRun.result && favoriteRun.result.failed ? " has-failures" : ""),
+          textContent: favoriteRun.message
+        })
+        : null
+    ].filter(Boolean));
   }
 
   function renderBatchSelectionBox() {
@@ -866,16 +1021,72 @@
           el("div", { textContent: "处理 " + (llmRun.processed || 0) + " / " + (llmRun.total || 0) + "，导入 " + (llmRun.imported || 0) + "，跳过 " + (llmRun.skipped || 0) + "，失败批次 " + failedBatchCount() }),
           llmRun.warnings && llmRun.warnings.length ? el("div", { textContent: "最近：" + llmRun.warnings[llmRun.warnings.length - 1] }) : null
         ].filter(Boolean))
-        ]),
-        el("section", { className: "ai-method manual-ai-method" }, [
-          el("div", { className: "ai-method-heading" }, [
-            el("h3", { textContent: "手动导入/导出" }),
-            el("p", { textContent: "复制 Prompt 给 ChatGPT、Gemini 或 DeepSeek，再把返回的 JSON 导入。" })
-          ]),
-          renderExchange()
         ])
       ])
     ]);
+  }
+
+  function renderDurationFilter() {
+    const current = core.normalizeDurationFilterPreset(activeFilter.durationPreset);
+    const custom = current === core.DURATION_FILTER_PRESETS.CUSTOM;
+    return el("div", { className: "duration-filter", title: "按视频时长筛选" }, [
+      el("span", { className: "duration-filter-label", textContent: "视频时长" }),
+      el("select", { title: "视频时长筛选", dataset: { role: "duration-preset" } }, durationFilterOptions(current)),
+      custom ? el("div", { className: "duration-range" }, [
+        el("input", {
+          type: "number",
+          min: "0",
+          step: "0.1",
+          value: activeFilter.durationMin,
+          placeholder: "最短分钟",
+          title: "最短时长（分钟）",
+          "aria-label": "最短时长（分钟）",
+          dataset: { role: "duration-min" }
+        }),
+        el("span", { textContent: "至" }),
+        el("input", {
+          type: "number",
+          min: "0",
+          step: "0.1",
+          value: activeFilter.durationMax,
+          placeholder: "最长分钟",
+          title: "最长时长（分钟）",
+          "aria-label": "最长时长（分钟）",
+          dataset: { role: "duration-max" }
+        })
+      ]) : null
+    ].filter(Boolean));
+  }
+
+  function renderWatchProgressFilter() {
+    const current = core.normalizeWatchProgressFilterPreset(activeFilter.watchProgressPreset);
+    return el("div", { className: "watch-progress-filter", title: "按观看进度筛选" }, [
+      el("span", { className: "watch-progress-filter-label", textContent: "观看进度" }),
+      el("select", { title: "观看进度筛选", dataset: { role: "watch-progress-preset" } }, watchProgressFilterOptions(current))
+    ]);
+  }
+
+  function watchProgressFilterOptions(current) {
+    const presets = core.WATCH_PROGRESS_FILTER_PRESETS;
+    return [
+      option(presets.ALL, "全部进度", current),
+      option(presets.NOT_STARTED, "未开始", current),
+      option(presets.IN_PROGRESS, "观看中", current),
+      option(presets.COMPLETED, "已看完", current)
+    ];
+  }
+
+  function durationFilterOptions(current) {
+    const presets = core.DURATION_FILTER_PRESETS;
+    return [
+      option(presets.ALL, "全部时长", current),
+      option(presets.UNDER_10, "少于 10 分钟", current),
+      option(presets.FROM_10_TO_30, "10-30 分钟", current),
+      option(presets.FROM_30_TO_60, "30-60 分钟", current),
+      option(presets.OVER_60, "60 分钟以上", current),
+      option(presets.UNKNOWN, "时长未知", current),
+      option(presets.CUSTOM, "自定义范围", current)
+    ];
   }
 
   function failedBatchCount() {
@@ -892,43 +1103,6 @@
         dataset: { role }
       })
     ]);
-  }
-
-  function renderExchange() {
-    const settings = state.settings || {};
-    const exportLimit = settings.manualExportLimit == null ? settings.batchSize || 80 : settings.manualExportLimit;
-    return el("div", { className: "exchange-panel" }, [
-        el("div", { className: "exchange-help" }, [
-          el("div", { textContent: "导出只选择待精细分类的视频；手动确认结果始终跳过。" }),
-          el("div", { textContent: "把 Prompt 复制给 ChatGPT/Gemini/Deepseek，再把返回的严格 JSON 粘贴回来导入。" }),
-          el("div", { textContent: "默认导入会替换非手动确认结果；勾选追加时只追加命中的分类。" })
-        ]),
-        el("label", { className: "field" }, [
-          el("span", { textContent: "导出数量" }),
-          el("input", {
-            type: "number",
-            min: "0",
-            max: "500",
-            step: "1",
-            value: exportLimit,
-            placeholder: "80，0 表示全部",
-            dataset: { role: "manual-export-limit" }
-          })
-        ]),
-        exchange.title ? el("div", { className: "exchange-title", textContent: exchange.title }) : null,
-        el("textarea", { dataset: { role: "exchange-text" }, value: exchange.text, placeholder: "这里会显示导出的 Prompt；也可以粘贴 AI 返回的 JSON。" }),
-        el("label", { className: "inline-check" }, [
-          el("input", { type: "checkbox", checked: exchange.append, dataset: { role: "import-append" } }),
-          text("导入时追加分类；结果记为 AI 分类")
-        ]),
-        el("div", { className: "exchange-actions" }, [
-          el("button", { dataset: { action: "export" }, textContent: "生成提示词" }),
-          el("button", { dataset: { action: "copy-exchange" }, textContent: "复制" }),
-          el("button", { className: "ghost", dataset: { action: "prepare-import" }, textContent: "粘贴 JSON" }),
-          el("button", { className: "primary", dataset: { action: "import-json" }, textContent: "导入 JSON" }),
-          el("button", { className: "ghost", dataset: { action: "hide-exchange" }, textContent: "清空" })
-        ])
-      ].filter(Boolean));
   }
 
   function renderApiSettings() {
@@ -991,7 +1165,7 @@
         el("span", { dataset: { role: "fold-icon" }, textContent: autoApiSettingsOpen ? "⌃" : "⌄" })
       ]),
       el("div", { className: "settings-subbody" + (autoApiSettingsOpen ? "" : " hidden") }, [
-        el("p", { className: "settings-help", textContent: "自动处理待精细分类的视频，手动确认始终跳过。浏览器需保持运行，实际触发时间可能稍有延迟。" }),
+        el("p", { className: "settings-help", textContent: "自动处理待精细分类的视频，手动确认始终跳过。数量模式会在打开或刷新整理助手，以及点击“同步并更新”后检查一次；浏览器需保持运行。" }),
         el("label", { className: "field" }, [
           el("span", { textContent: "自动分类条件" }),
           el("select", { dataset: { role: "llm-auto-classify-mode" } }, [
@@ -1062,12 +1236,6 @@
     } else if (action === "resume-onboarding-api") {
       onboardingPanelDismissed = false;
       renderShell();
-    } else if (action === "copy-onboarding-prompt") {
-      copyOnboardingPrompt();
-    } else if (action === "regenerate-onboarding-prompt") {
-      loadOnboardingPrompt();
-    } else if (action === "import-onboarding-json") {
-      importOnboardingJson();
     } else if (action === "reopen-onboarding-categories") {
       reopenOnboardingCategories();
     } else if (action === "adjust-onboarding-result") {
@@ -1078,18 +1246,30 @@
       startOnboardingClassification(target.dataset.mode);
     } else if (action === "complete-onboarding") {
       completeOnboarding("首次引导已完成，所有分类方式仍可随时使用");
+    } else if (action === "set-browse-mode") {
+      setBrowseMode(target.dataset.mode);
+    } else if (action === "set-video-view") {
+      setVideoViewMode(target.dataset.mode);
     } else if (action === "filter-all") {
-      activeFilter = { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" };
+      activeFilter = emptyFilterWithDuration();
       renderShell();
     } else if (action === "filter-unclassified") {
-      activeFilter = { categoryIds: [], includeUnclassified: true, includeRemoved: false, sourceCategoryId: "" };
+      activeFilter = Object.assign(emptyFilterWithDuration(), { includeUnclassified: true });
       renderShell();
     } else if (action === "filter-category") {
       if (suppressCategoryClick) return;
       const categoryId = target.dataset.categoryId;
       activeFilter = activeFilter.sourceCategoryId === categoryId
-        ? { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" }
-        : { categoryIds: expandCategoryIds([categoryId]), includeUnclassified: false, includeRemoved: false, sourceCategoryId: categoryId };
+        ? emptyFilterWithDuration()
+        : Object.assign(emptyFilterWithDuration(), { categoryIds: expandCategoryIds([categoryId]), sourceCategoryId: categoryId });
+      renderShell();
+    } else if (action === "toggle-category-collapse") {
+      toggleCategoryCollapse(target.dataset.categoryId);
+    } else if (action === "filter-up") {
+      const upGroupKey = target.dataset.upGroupKey || "";
+      activeFilter = activeFilter.upGroupKey === upGroupKey
+        ? emptyFilterWithDuration()
+        : Object.assign(emptyFilterWithDuration(), { upGroupKey });
       renderShell();
     } else if (action === "select-video") {
       if (suppressNextCardClick) {
@@ -1121,6 +1301,10 @@
       bulkAddCategory();
     } else if (action === "batch-clear-categories") {
       bulkClearCategories();
+    } else if (action === "bulk-remove-watchlater") {
+      bulkRemoveFromWatchlater();
+    } else if (action === "create-favorite-folder") {
+      createFavoriteFolder();
     } else if (action === "save-llm-settings") {
       saveLlmSettings();
     } else if (action === "save-auto-llm-settings") {
@@ -1164,19 +1348,6 @@
       runDetails();
     } else if (action === "auto-classify") {
       autoClassify();
-    } else if (action === "export") {
-      exportBatch();
-    } else if (action === "show-import") {
-      showImportBox();
-    } else if (action === "prepare-import") {
-      showImportBox();
-    } else if (action === "copy-exchange") {
-      copyExchangeText();
-    } else if (action === "import-json") {
-      importJson();
-    } else if (action === "hide-exchange") {
-      exchange = { visible: false, title: "", text: "", append: exchange.append, mode: "import" };
-      renderEditorOnly();
     } else if (action === "add-category") {
       addCategory();
     } else if (action === "delete-category") {
@@ -1187,14 +1358,6 @@
       discardCategoryDraft();
     } else if (action === "generate-categories-api") {
       generateCategoriesWithApi();
-    } else if (action === "toggle-category-prompt") {
-      toggleCategoryPrompt();
-    } else if (action === "load-category-prompt") {
-      loadCategoryPrompt();
-    } else if (action === "copy-category-prompt") {
-      copyCategoryPrompt();
-    } else if (action === "import-category-prompt") {
-      importCategoryPrompt();
     } else if (action === "save-manual") {
       saveManualClassification(target.dataset.bvid);
     } else if (action === "remove-watchlater") {
@@ -1208,14 +1371,117 @@
     }
   }
 
+  function emptyFilter() {
+    return {
+      categoryIds: [],
+      includeUnclassified: false,
+      includeRemoved: false,
+      sourceCategoryId: "",
+      upGroupKey: "",
+      watchProgressPreset: core.WATCH_PROGRESS_FILTER_PRESETS.ALL,
+      durationPreset: core.DURATION_FILTER_PRESETS.ALL,
+      durationMin: "",
+      durationMax: ""
+    };
+  }
+
+  function emptyFilterWithDuration() {
+    return Object.assign(emptyFilter(), {
+      watchProgressPreset: core.normalizeWatchProgressFilterPreset(activeFilter.watchProgressPreset),
+      durationPreset: core.normalizeDurationFilterPreset(activeFilter.durationPreset),
+      durationMin: activeFilter.durationMin == null ? "" : activeFilter.durationMin,
+      durationMax: activeFilter.durationMax == null ? "" : activeFilter.durationMax
+    });
+  }
+
+  async function setBrowseMode(modeValue) {
+    const nextMode = core.normalizeBrowseMode(modeValue);
+    if (nextMode === browseMode()) return;
+    activeFilter = emptyFilterWithDuration();
+    selectedBvids = new Set();
+    try {
+      updateState(await send({
+        type: message.UPDATE_SETTINGS,
+        settings: { browseMode: nextMode }
+      }));
+      setStatus(nextMode === core.BROWSE_MODES.UP ? "已切换为按 UP 主浏览" : "已切换为按分类目录浏览");
+    } catch (error) {
+      setStatus("保存浏览模式失败：" + error.message);
+    }
+  }
+
+  function toggleCategoryCollapse(categoryId) {
+    const category = state.categories.find((item) => item.id === categoryId);
+    if (!category || category.parentId || !core.childrenOf(state.categories, categoryId).length) return;
+
+    const previousIds = collapsedCategoryIds();
+    const nextIds = new Set(previousIds);
+    if (nextIds.has(categoryId)) nextIds.delete(categoryId);
+    else nextIds.add(categoryId);
+    const normalizedIds = core.normalizeCollapsedCategoryIds(Array.from(nextIds));
+    state = Object.assign({}, state, {
+      settings: Object.assign({}, state.settings, { collapsedCategoryIds: normalizedIds })
+    });
+    renderShell();
+
+    const changeId = ++categoryCollapseChangeId;
+    categoryCollapseSaveQueue = categoryCollapseSaveQueue
+      .catch(() => {})
+      .then(() => send({
+        type: message.UPDATE_SETTINGS,
+        settings: { collapsedCategoryIds: normalizedIds }
+      }))
+      .then((nextState) => {
+        if (changeId === categoryCollapseChangeId) updateState(nextState);
+      })
+      .catch((error) => {
+        if (changeId !== categoryCollapseChangeId) return;
+        state = Object.assign({}, state, {
+          settings: Object.assign({}, state.settings, { collapsedCategoryIds: previousIds })
+        });
+        renderShell();
+        setStatus("保存分类目录显示设置失败：" + error.message);
+      });
+  }
+
+  function setVideoViewMode(modeValue) {
+    const nextMode = core.normalizeVideoViewMode(modeValue);
+    const previousMode = videoViewMode();
+    if (nextMode === previousMode) return;
+    const changeId = ++videoViewChangeId;
+    state = Object.assign({}, state, {
+      settings: Object.assign({}, state.settings, { videoViewMode: nextMode })
+    });
+    renderShell();
+
+    videoViewSaveQueue = videoViewSaveQueue
+      .catch(() => {})
+      .then(() => send({
+        type: message.UPDATE_SETTINGS,
+        settings: { videoViewMode: nextMode }
+      }))
+      .then((nextState) => {
+        if (changeId !== videoViewChangeId) return;
+        updateState(nextState);
+        setStatus(nextMode === core.VIDEO_VIEW_MODES.LIST ? "已切换为列表视图" : "已切换为卡片视图");
+      })
+      .catch((error) => {
+        if (changeId !== videoViewChangeId) return;
+        state = Object.assign({}, state, {
+          settings: Object.assign({}, state.settings, { videoViewMode: previousMode })
+        });
+        renderShell();
+        setStatus("保存视图设置失败：" + error.message);
+      });
+  }
+
   async function chooseOnboardingMethod(methodValue) {
-    const methodName = ["categories", "api", "prompt"].includes(methodValue) ? methodValue : "categories";
+    const methodName = ["categories", "api"].includes(methodValue) ? methodValue : "categories";
     onboardingPanelDismissed = methodName === "categories";
     if (methodName === "categories") categoryAdminOpen = true;
     try {
       await updateOnboardingSettings({ onboardingStage: "setup-" + methodName, onboardingMethod: methodName });
       if (methodName === "categories") revealOnboardingPanel(methodName);
-      if (methodName === "prompt") await loadOnboardingPrompt();
     } catch (error) {
       onboardingPanelDismissed = false;
       setStatus("保存首次设置失败：" + error.message);
@@ -1252,11 +1518,10 @@
       return;
     }
     const methodName = core.normalizeText(state.settings && state.settings.onboardingMethod);
-    const stage = methodName === "api" ? "setup-api" : methodName === "prompt" ? "setup-prompt" : "setup";
+    const stage = methodName === "api" ? "setup-api" : "setup";
     onboardingPanelDismissed = false;
     try {
       await updateOnboardingSettings({ onboardingStage: stage });
-      if (stage === "setup-prompt" && !onboardingPromptText) await loadOnboardingPrompt();
     } catch (error) {
       setStatus("返回分类目录设置步骤失败：" + error.message);
     }
@@ -1273,10 +1538,10 @@
     setStatus("正在让 AI 生成新的分类目录…");
     try {
       onboardingCategoryRunning = true;
-      onboardingCategoryMessage = "正在读取现有视频标题并请求 AI…";
+      onboardingCategoryMessage = "正在读取现有视频信息并请求 AI…";
       renderShell();
-      const exported = await send({ type: message.EXPORT_CATEGORY_PROPOSAL, limit: 60 });
-      onboardingCategoryMessage = "已抽取 " + (exported.sampleCount || 0) + " 个标题，正在生成分类目录...";
+      const exported = await send({ type: message.EXPORT_CATEGORY_PROPOSAL });
+      onboardingCategoryMessage = "已准备 " + (exported.sampleCount || 0) + " 个视频的信息，正在生成分类目录...";
       renderShell();
       const payload = await callCategoryLlm(config, exported.prompt || "");
       onboardingCategoryRunning = false;
@@ -1295,54 +1560,6 @@
     settingsPanelOpen = true;
     apiSettingsOpen = true;
     renderShell();
-  }
-
-  async function loadOnboardingPrompt() {
-    if (onboardingPromptLoading) return;
-    onboardingPromptLoading = true;
-    renderShell();
-    try {
-      const result = await send({
-        type: message.EXPORT_CATEGORY_PROPOSAL,
-        limit: 60
-      });
-      onboardingPromptText = result.prompt || "";
-      setStatus("已根据 " + (result.sampleCount || 0) + " 个视频标题生成分类目录 Prompt");
-    } catch (error) {
-      onboardingPromptText = "";
-      setStatus("生成首次 Prompt 失败：" + error.message);
-    } finally {
-      onboardingPromptLoading = false;
-      renderShell();
-    }
-  }
-
-  async function copyOnboardingPrompt() {
-    if (!onboardingPromptText) {
-      setStatus("Prompt 还没有生成完成");
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(onboardingPromptText);
-      setStatus("首次 Prompt 已复制到剪贴板");
-    } catch (error) {
-      setStatus("复制 Prompt 失败：" + error.message);
-    }
-  }
-
-  async function importOnboardingJson() {
-    const textarea = document.querySelector('[data-role="onboarding-prompt-import"]');
-    const payload = textarea ? textarea.value : "";
-    if (!core.normalizeText(payload)) {
-      setStatus("请先粘贴 AI 返回的 JSON");
-      return;
-    }
-    setStatus("正在导入新的分类目录 JSON…");
-    try {
-      await confirmAndImportCategories(parseJsonObject(payload), "prompt", "手动 Prompt");
-    } catch (error) {
-      setStatus("导入分类目录失败：" + error.message);
-    }
   }
 
   async function handleOnboardingCategoryImport(result, sourceLabel) {
@@ -1395,17 +1612,16 @@
   }
 
   async function startOnboardingClassification(modeValue) {
-    const modeName = ["manual", "prompt", "api"].includes(modeValue) ? modeValue : "manual";
+    const modeName = ["manual", "api"].includes(modeValue) ? modeValue : "manual";
     onboardingPanelDismissed = true;
     if (modeName === "manual") manualEditorOpen = true;
-    if (modeName === "prompt" || modeName === "api") llmPanelOpen = true;
+    if (modeName === "api") llmPanelOpen = true;
     if (modeName === "api" && !apiSettingsReady(state.settings || {})) {
       settingsPanelOpen = true;
       apiSettingsOpen = true;
     }
     try {
       await updateOnboardingSettings({ onboardingStage: "classify" });
-      if (modeName === "prompt") await exportInitialPrompt();
       if (modeName === "api" && !apiSettingsReady(state.settings || {})) {
         setStatus("API 尚未设置完整，请先在“设置”中填写并测试 API");
       }
@@ -1415,26 +1631,6 @@
       setStatus("启动首次分类失败：" + error.message);
       renderShell();
     }
-  }
-
-  async function exportInitialPrompt() {
-    setStatus("正在生成精简首次分类 Prompt...");
-    const result = await send({
-      type: message.EXPORT_CLASSIFY_BATCH,
-      limit: Math.min(40, Math.max(1, presentVideos().length)),
-      randomize: true,
-      titleOnly: true,
-      compact: true
-    });
-    exchange = {
-      visible: true,
-      title: "首次分类 Prompt：随机抽样，仅包含 BV 号和标题",
-      text: result.prompt || "",
-      append: false,
-      mode: "export"
-    };
-    renderEditorOnly();
-    setStatus("已生成 " + (result.batchSize || 0) + " 个视频的精简 Prompt；复制给 AI 后，把 JSON 粘贴回来导入");
   }
 
   async function completeOnboarding(statusMessage) {
@@ -1452,6 +1648,10 @@
   }
 
   function onDragStart(event) {
+    if (event.target && event.target.closest && event.target.closest(".category-collapse-toggle")) {
+      event.preventDefault();
+      return;
+    }
     const group = event.target.closest(".category-tree-group[data-category-group]");
     if (!group || !group.draggable) return;
     draggedCategoryId = group.dataset.categoryGroup || "";
@@ -1538,7 +1738,7 @@
   }
 
   function categoryDropPosition(group, clientY) {
-    const row = Array.from(group.children).find((child) => child.classList && child.classList.contains("cat-row"));
+    const row = group.querySelector(".category-row-layout > .cat-row");
     if (!row) return "before";
     const rect = row.getBoundingClientRect();
     return clientY < rect.top + rect.height / 2 ? "before" : "after";
@@ -1554,14 +1754,13 @@
     if (event.target.dataset.role === "search") {
       searchText = event.target.value;
       renderVideoResults();
-    } else if (event.target.dataset.role === "exchange-text") {
-      exchange.text = event.target.value;
-    } else if (event.target.dataset.role === "category-prompt-import") {
-      categoryGeneration.importText = event.target.value;
     } else if (["llm-base-url", "llm-api-format", "llm-model", "llm-api-key", "llm-temperature", "llm-use-response-format"].includes(event.target.dataset.role)) {
       apiSettingsDraft = collectApiSettings();
     } else if (event.target.dataset.role === "llm-auto-classify-threshold") {
       autoApiSettingsDraft = collectAutoLlmSettings();
+    } else if (event.target.dataset.role === "favorite-folder-title") {
+      favoriteFolderTitle = event.target.value;
+      updateFavoriteFolderUi();
     } else if (event.target.dataset.role === "category-name") {
       const category = ensureCategoryDraft().find((item) => item.id === event.target.dataset.categoryId);
       if (category) category.name = event.target.value;
@@ -1700,6 +1899,8 @@
       if (mark) mark.textContent = selected ? "✓" : "";
     });
     updateBatchCounts();
+    updateFavoriteFolderUi();
+    updateBulkRemoveUi();
   }
 
   function updateSelectedVideoUi() {
@@ -1725,12 +1926,75 @@
     if (editorCount) editorCount.textContent = batchEditorCountText();
   }
 
+  function updateFavoriteFolderUi() {
+    const count = document.querySelector('[data-role="favorite-panel-count"]');
+    if (count) count.textContent = "当前选择 " + selectedBvids.size + " 个视频";
+    const button = document.querySelector('[data-action="create-favorite-folder"]');
+    if (button) {
+      button.disabled = favoriteRun.running || !selectedBvids.size || !core.normalizeText(favoriteFolderTitle);
+      button.textContent = favoriteRun.running ? "正在创建并加入…" : "新建收藏夹并加入";
+    }
+  }
+
+  function updateBulkRemoveUi() {
+    const button = document.querySelector('[data-action="bulk-remove-watchlater"]');
+    if (!button) return;
+    button.disabled = favoriteRun.running || bulkRemoveRun.running || !selectedBvids.size;
+    button.textContent = bulkRemoveRun.running ? "正在批量移出…" : "批量移出稍后再看";
+  }
+
   function batchPanelCountText() {
     return "已选择 " + selectedBvids.size + " 个视频。可点击卡片、框选，或全选当前结果。";
   }
 
   function batchEditorCountText() {
     return "已选择 " + selectedBvids.size + " 个视频";
+  }
+
+  function favoriteResultText(result) {
+    const folder = result && result.folder || {};
+    const failedText = result.failed ? "，失败 " + result.failed + " 个" : "";
+    return "已创建私密收藏夹“" + (folder.title || "新收藏夹") + "”：成功加入 " + (result.added || 0) + " 个，跳过 " + (result.skipped || 0) + " 个" + failedText + "。";
+  }
+
+  async function createFavoriteFolder() {
+    if (favoriteRun.running) return;
+    const title = core.normalizeText(favoriteFolderTitle);
+    if (!title) {
+      setStatus("请填写收藏夹名称");
+      return;
+    }
+    if (!selectedBvids.size) {
+      setStatus("请先选择视频");
+      return;
+    }
+
+    favoriteRun = { running: true, result: null, message: "正在创建收藏夹并加入视频…" };
+    renderShell();
+    setStatus("正在创建收藏夹并加入视频…");
+    try {
+      const result = await send({
+        type: message.CREATE_FAVORITE_FOLDER_AND_ADD,
+        title,
+        bvids: Array.from(selectedBvids)
+      });
+      const output = result.favoriteResult || {};
+      favoriteRun = {
+        running: false,
+        result: output,
+        message: favoriteResultText(output)
+      };
+      updateState(result);
+      setStatus(favoriteRun.message);
+    } catch (error) {
+      favoriteRun = {
+        running: false,
+        result: null,
+        message: "创建收藏夹失败：" + error.message
+      };
+      renderShell();
+      setStatus("创建收藏夹失败：" + error.message);
+    }
   }
 
   function updateBatchCategorySwatch() {
@@ -1818,10 +2082,28 @@
       send({ type: message.UPDATE_SETTINGS, settings: { sortDirection: event.target.value } })
         .then(updateState)
         .catch((error) => setStatus(error.message));
-    } else if (role === "import-append") {
-      exchange.append = event.target.checked;
-    } else if (role === "manual-export-limit") {
-      send({ type: message.UPDATE_SETTINGS, settings: { manualExportLimit: manualExportLimit() } })
+    } else if (role === "duration-preset") {
+      const durationPreset = core.normalizeDurationFilterPreset(event.target.value);
+      activeFilter = Object.assign({}, activeFilter, {
+        durationPreset,
+        durationMin: durationPreset === core.DURATION_FILTER_PRESETS.CUSTOM ? activeFilter.durationMin : "",
+        durationMax: durationPreset === core.DURATION_FILTER_PRESETS.CUSTOM ? activeFilter.durationMax : ""
+      });
+      renderShell();
+    } else if (role === "watch-progress-preset") {
+      activeFilter = Object.assign({}, activeFilter, {
+        watchProgressPreset: core.normalizeWatchProgressFilterPreset(event.target.value)
+      });
+      renderShell();
+    } else if (["duration-min", "duration-max"].includes(role)) {
+      applyCustomDurationFilter();
+    } else if (role === "category-sample-limit") {
+      const sampleLimit = Math.floor(Number(event.target.value));
+      if (!Number.isFinite(sampleLimit) || sampleLimit < 1) {
+        setStatus("分类目录样本数量至少为 1");
+        return;
+      }
+      send({ type: message.UPDATE_SETTINGS, settings: { categorySampleLimit: sampleLimit } })
         .then(updateState)
         .catch((error) => setStatus(error.message));
     } else if (role === "llm-auto-classify-mode") {
@@ -1888,6 +2170,58 @@
     await bulkUpdate({ action: "clear" });
   }
 
+  function bulkRemoveResultText(result) {
+    const removed = Number(result && result.successCount != null ? result.successCount : result && result.removed) || 0;
+    const failed = Number(result && result.failureCount != null ? result.failureCount : result && result.failed) || 0;
+    return "批量移出完成：成功 " + removed + " 个，失败 " + failed + " 个。" +
+      (failed ? "失败的视频仍保留在选择中，可以重试。" : "本地视频记录和分类结果已保留。");
+  }
+
+  async function bulkRemoveFromWatchlater() {
+    if (bulkRemoveRun.running || favoriteRun.running) return;
+    const bvids = Array.from(selectedBvids);
+    if (!bvids.length) {
+      setStatus("请先选择视频");
+      return;
+    }
+    const confirmed = await confirmAction({
+      title: "批量移出稍后再看？",
+      message: "将从 B站稍后再看中移出 " + bvids.length + " 个视频。\n本地视频记录、分类结果和手动确认会保留；失败的视频仍会保留在选择中。",
+      confirmLabel: "批量移出"
+    });
+    if (!confirmed) return;
+
+    bulkRemoveRun = { running: true, result: null, message: "正在批量移出稍后再看…", failed: false };
+    renderShell();
+    setStatus("正在批量移出稍后再看…");
+    try {
+      const result = await send({
+        type: message.BULK_REMOVE_FROM_WATCHLATER,
+        bvids
+      });
+      const output = result.bulkRemoveResult || {};
+      const removed = new Set((output.removedBvids || []).map((bvid) => core.normalizeBvid(bvid)).filter(Boolean));
+      selectedBvids = new Set(bvids.filter((bvid) => !removed.has(bvid)));
+      bulkRemoveRun = {
+        running: false,
+        result: output,
+        message: bulkRemoveResultText(output),
+        failed: Boolean(output.failed)
+      };
+      updateState(result);
+      setStatus(bulkRemoveRun.message);
+    } catch (error) {
+      bulkRemoveRun = {
+        running: false,
+        result: null,
+        message: "批量移出失败：" + error.message,
+        failed: true
+      };
+      renderShell();
+      setStatus("批量移出稍后再看失败：" + error.message);
+    }
+  }
+
   async function bulkUpdate(payload) {
     if (!selectedBvids.size) {
       setStatus("请先选择视频");
@@ -1911,8 +2245,17 @@
   async function syncAndRefresh() {
     const synced = await scan();
     if (!synced) return;
+    await checkAutoLlmOnRefresh();
     setStatus(scanStatusText(synced.scanResult, synced.autoClassifyResult) + "；正在更新详情...");
     await runDetails({ source: "manual-combined" });
+  }
+
+  async function checkAutoLlmOnRefresh() {
+    try {
+      updateState(await send({ type: message.CHECK_AUTO_LLM }));
+    } catch (error) {
+      setStatus("刷新时自动分类检查失败：" + error.message);
+    }
   }
 
   async function syncAfterClassificationChange(reason) {
@@ -2035,68 +2378,6 @@
     return "初步分类完成：写入 " + (output.classified || 0) + " 个，跳过手动确认 " + (output.skippedManual || 0) + " 个，保留已有 " + (output.unchanged || 0) + " 个";
   }
 
-  async function exportBatch() {
-    setStatus("正在生成待精细分类视频的提示词…");
-    try {
-      const limit = manualExportLimit();
-      updateState(await send({ type: message.UPDATE_SETTINGS, settings: { manualExportLimit: limit } }));
-      const result = await send({ type: message.EXPORT_CLASSIFY_BATCH, limit: limit > 0 ? limit : "all" });
-      exchange = {
-        visible: true,
-        title: "复制到 ChatGPT/Gemini：待精细分类视频",
-        text: result.prompt || "",
-        append: result.mergeMode === "append",
-        mode: "export"
-      };
-      llmPanelOpen = true;
-      renderEditorOnly();
-      setStatus("已生成 " + (result.batchSize || 0) + " 个待精细分类视频的提示词，候选共 " + (result.totalCandidates || 0) + " 个");
-    } catch (error) {
-      setStatus("导出失败：" + error.message);
-    }
-  }
-
-  function showImportBox() {
-    exchange = {
-      visible: true,
-      title: "粘贴 AI 返回的 JSON",
-      text: "",
-      append: false,
-      mode: "import"
-    };
-    llmPanelOpen = true;
-    renderEditorOnly();
-  }
-
-  async function copyExchangeText() {
-    try {
-      await navigator.clipboard.writeText(exchange.text || "");
-      setStatus("已复制到剪贴板");
-    } catch (error) {
-      setStatus("复制失败：" + error.message);
-    }
-  }
-
-  async function importJson() {
-    const textarea = document.querySelector('[data-role="exchange-text"]');
-    const append = Boolean(document.querySelector('[data-role="import-append"]') && document.querySelector('[data-role="import-append"]').checked);
-    setStatus("正在导入分类 JSON...");
-    try {
-      const result = await send({
-        type: message.IMPORT_CLASSIFICATIONS,
-        payload: textarea ? textarea.value : exchange.text,
-        options: { mergeMode: append ? "append" : "replace" }
-      });
-      exchange.visible = false;
-      updateState(result);
-      const imported = result.importResult || {};
-      setStatus("导入 " + (imported.imported || 0) + " 项，跳过 " + (imported.skipped || 0) + " 项" + (imported.warnings && imported.warnings.length ? "；有警告" : ""));
-      if (imported.imported) await finishClassificationAndSync("AI 分类已导入");
-    } catch (error) {
-      setStatus("导入失败：" + error.message);
-    }
-  }
-
   async function exportDataBackup() {
     if (dataBackupState.running) return;
     dataBackupState = { running: true, message: "正在准备数据备份…" };
@@ -2169,8 +2450,7 @@
     categoryDraftDirty = false;
     apiSettingsDraft = null;
     autoApiSettingsDraft = null;
-    categoryGeneration = { mode: "", running: false, loading: false, prompt: "", importText: "", message: "" };
-    exchange = { visible: false, title: "", text: "", append: exchange.append, mode: "import" };
+    categoryGeneration = { running: false, message: "" };
     apiTestState = { running: false, message: "" };
   }
 
@@ -2343,7 +2623,7 @@
       llmRun.message = "正在导出第 " + (llmRun.batches.length + 1) + " 批...";
       renderEditorOnly();
       const exported = await send({
-        type: message.EXPORT_CLASSIFY_BATCH,
+        type: message.EXPORT_AI_CLASSIFY_BATCH,
         includeAll,
         limit: requested,
         offset
@@ -2371,9 +2651,9 @@
         llmRun.message = "正在导入第 " + batch.index + " 批...";
         renderEditorOnly();
         const importedState = await send({
-          type: message.IMPORT_CLASSIFICATIONS,
+          type: message.IMPORT_AI_CLASSIFICATIONS,
           payload: JSON.stringify(payload),
-          options: { mergeMode: "replace" }
+          options: { mergeMode: "replace", batchBvids: exported.batchBvids }
         });
         const importResult = importedState.importResult || {};
         batch.status = "done";
@@ -2525,62 +2805,6 @@
     return core.llmApiUrl(value, core.LLM_API_FORMATS.CHAT_COMPLETIONS);
   }
 
-  function toggleCategoryPrompt() {
-    categoryGeneration.mode = categoryGeneration.mode === "prompt" ? "" : "prompt";
-    renderEditorOnly();
-    if (categoryGeneration.mode === "prompt" && !categoryGeneration.prompt) loadCategoryPrompt();
-  }
-
-  async function loadCategoryPrompt() {
-    if (categoryGeneration.loading) return;
-    categoryGeneration.mode = "prompt";
-    categoryGeneration.loading = true;
-    categoryGeneration.message = "正在根据现有视频生成分类目录 Prompt…";
-    renderEditorOnly();
-    try {
-      const result = await send({ type: message.EXPORT_CATEGORY_PROPOSAL, limit: 60 });
-      categoryGeneration.prompt = result.prompt || "";
-      categoryGeneration.message = "已根据 " + (result.sampleCount || 0) + " 个视频标题生成 Prompt。";
-      setStatus(categoryGeneration.message);
-    } catch (error) {
-      categoryGeneration.prompt = "";
-      categoryGeneration.message = "生成 Prompt 失败：" + error.message;
-      setStatus(categoryGeneration.message);
-    } finally {
-      categoryGeneration.loading = false;
-      renderEditorOnly();
-    }
-  }
-
-  async function copyCategoryPrompt() {
-    if (!categoryGeneration.prompt) {
-      setStatus("请先生成分类目录 Prompt");
-      return;
-    }
-    try {
-      await navigator.clipboard.writeText(categoryGeneration.prompt);
-      setStatus("分类目录 Prompt 已复制到剪贴板");
-    } catch (error) {
-      setStatus("复制分类目录 Prompt 失败：" + error.message);
-    }
-  }
-
-  async function importCategoryPrompt() {
-    const raw = valueByRole("category-prompt-import") || categoryGeneration.importText;
-    if (!core.normalizeText(raw)) {
-      setStatus("请先粘贴 AI 返回的 categories JSON");
-      return;
-    }
-    categoryGeneration.importText = raw;
-    try {
-      await confirmAndImportCategories(parseJsonObject(raw), "prompt", "手动 Prompt");
-    } catch (error) {
-      categoryGeneration.message = "导入分类目录失败：" + error.message;
-      setStatus(categoryGeneration.message);
-      renderEditorOnly();
-    }
-  }
-
   async function generateCategoriesWithApi() {
     if (categoryGeneration.running) return;
     const config = Object.assign({}, state.settings || {});
@@ -2589,11 +2813,11 @@
       return;
     }
     categoryGeneration.running = true;
-    categoryGeneration.message = "正在读取现有视频标题…";
+    categoryGeneration.message = "正在读取现有视频信息…";
     renderEditorOnly();
     try {
-      const exported = await send({ type: message.EXPORT_CATEGORY_PROPOSAL, limit: 60 });
-      categoryGeneration.message = "已抽取 " + (exported.sampleCount || 0) + " 个标题，正在请求 AI 生成分类目录…";
+      const exported = await send({ type: message.EXPORT_CATEGORY_PROPOSAL });
+      categoryGeneration.message = "已准备 " + (exported.sampleCount || 0) + " 个视频的信息，正在请求 AI 生成分类目录…";
       renderEditorOnly();
       const payload = await callCategoryLlm(config, exported.prompt || "");
       categoryGeneration.running = false;
@@ -2631,7 +2855,6 @@
     });
     categoryDraft = null;
     categoryDraftDirty = false;
-    categoryGeneration.importText = "";
     categoryGeneration.message = sourceLabel + " 已生成新的分类目录。";
     if (onboardingActive()) {
       await handleOnboardingCategoryImport(result, sourceLabel);
@@ -2699,7 +2922,7 @@
       const saved = result.categorySaveResult || {};
       const keyword = saved.keywordResult || {};
       if (activeFilter.categoryIds.some((id) => (saved.removedCategoryIds || []).includes(id))) {
-        activeFilter = { categoryIds: [], includeUnclassified: false, includeRemoved: false, sourceCategoryId: "" };
+        activeFilter = emptyFilterWithDuration();
       }
       categoryDraft = null;
       categoryDraftDirty = false;
@@ -2707,7 +2930,7 @@
       const keywordText = keyword.skipped
         ? "首次引导阶段暂不判定视频"
         : "已对全部 " + (keyword.checked || 0) + " 个视频进行新增目录的初步分类（包括手动确认和 AI 分类），命中 " + (keyword.matchedVideos || 0) + " 个视频";
-      setStatus("分类目录已保存；" + keywordText + "。如需对视频进行细分类，可使用 AI (API) 或 AI (手动导入/导出) 批量视频分类。" );
+      setStatus("分类目录已保存；" + keywordText + "。如需对视频进行细分类，可使用 AI (API) 批量视频分类。" );
     } catch (error) {
       setStatus("分类保存失败：" + error.message);
     }
@@ -2785,13 +3008,9 @@
   function visibleVideos() {
     const classifications = classificationMap();
     const query = core.normalizeText(searchText).toLowerCase();
-    return presentVideos()
-      .filter((video) => {
-        if (activeFilter.includeUnclassified) {
-          return core.needsLlmExport(video, classifications.get(video.bvid));
-        }
-        return core.matchesFilter(video, classifications.get(video.bvid), activeFilter);
-      })
+    const currentVideos = presentVideos();
+    return currentVideos
+      .filter((video) => core.matchesFilter(video, classifications.get(video.bvid), activeFilter, currentVideos))
       .filter((video) => {
         if (!query) return true;
         const haystack = [
@@ -2895,6 +3114,14 @@
     return Array.from(expanded);
   }
 
+  function collapsedCategoryIds() {
+    return core.normalizeCollapsedCategoryIds(state.settings && state.settings.collapsedCategoryIds);
+  }
+
+  function isCategoryCollapsed(categoryId) {
+    return collapsedCategoryIds().includes(categoryId);
+  }
+
   function categoryLabel(category) {
     return core.categoryPath(category, core.categoryById(state.categories)) || category.name || category.id;
   }
@@ -2939,14 +3166,76 @@
   }
 
   function activeFilterLabel() {
-    if (activeFilter.includeUnclassified) return "筛选：待精细分类";
-    if (!activeFilter.categoryIds.length) return "筛选：全部";
-    const ids = activeFilter.sourceCategoryId ? [activeFilter.sourceCategoryId] : activeFilter.categoryIds;
-    const names = ids
-      .map((id) => state.categories.find((category) => category.id === id))
-      .filter(Boolean)
-      .map((category) => category.name);
-    return "筛选：" + names.slice(0, 3).join("、") + (names.length > 3 ? " 等" : "");
+    const labels = [];
+    if (activeFilter.includeUnclassified) labels.push("待精细分类");
+    if (activeFilter.upGroupKey) {
+      const group = core.upGroups(presentVideos()).find((item) => item.key === activeFilter.upGroupKey);
+      labels.push("UP 主 · " + (group ? group.name : "未知 UP 主"));
+    }
+    if (activeFilter.categoryIds.length) {
+      const ids = activeFilter.sourceCategoryId ? [activeFilter.sourceCategoryId] : activeFilter.categoryIds;
+      const names = ids
+        .map((id) => state.categories.find((category) => category.id === id))
+        .filter(Boolean)
+        .map((category) => category.name);
+      if (names.length) labels.push(names.slice(0, 3).join("、") + (names.length > 3 ? " 等" : ""));
+    }
+    const durationLabel = activeDurationFilterLabel();
+    if (durationLabel) labels.push("视频时长 · " + durationLabel);
+    const watchProgressLabel = activeWatchProgressFilterLabel();
+    if (watchProgressLabel) labels.push("观看进度 · " + watchProgressLabel);
+    return labels.length ? "筛选：" + labels.join(" · ") : "筛选：全部";
+  }
+
+  function activeWatchProgressFilterLabel() {
+    const presets = core.WATCH_PROGRESS_FILTER_PRESETS;
+    const preset = core.normalizeWatchProgressFilterPreset(activeFilter.watchProgressPreset);
+    if (preset === presets.ALL) return "";
+    if (preset === presets.NOT_STARTED) return "未开始";
+    if (preset === presets.IN_PROGRESS) return "观看中";
+    if (preset === presets.COMPLETED) return "已看完";
+    return "";
+  }
+
+  function activeDurationFilterLabel() {
+    const presets = core.DURATION_FILTER_PRESETS;
+    const preset = core.normalizeDurationFilterPreset(activeFilter.durationPreset);
+    if (preset === presets.ALL) return "";
+    if (preset === presets.UNKNOWN) return "时长未知";
+    if (preset === presets.UNDER_10) return "少于 10 分钟";
+    if (preset === presets.FROM_10_TO_30) return "10-30 分钟";
+    if (preset === presets.FROM_30_TO_60) return "30-60 分钟";
+    if (preset === presets.OVER_60) return "60 分钟以上";
+    const minimum = activeFilter.durationMin == null || activeFilter.durationMin === "" ? "" : String(activeFilter.durationMin);
+    const maximum = activeFilter.durationMax == null || activeFilter.durationMax === "" ? "" : String(activeFilter.durationMax);
+    if (!minimum && !maximum) return "自定义范围";
+    return (minimum || "不限") + " 至 " + (maximum || "不限") + " 分钟";
+  }
+
+  function applyCustomDurationFilter() {
+    const minimum = readDurationBound(document.querySelector('[data-role="duration-min"]'));
+    const maximum = readDurationBound(document.querySelector('[data-role="duration-max"]'));
+    if (minimum === null || maximum === null) {
+      setStatus("自定义时长必须是 0 或更大的数字");
+      return;
+    }
+    if (minimum !== "" && maximum !== "" && minimum > maximum) {
+      setStatus("最短时长不能大于最长时长");
+      return;
+    }
+    activeFilter = Object.assign({}, activeFilter, {
+      durationPreset: core.DURATION_FILTER_PRESETS.CUSTOM,
+      durationMin: minimum,
+      durationMax: maximum
+    });
+    renderShell();
+  }
+
+  function readDurationBound(input) {
+    const value = input && input.value != null ? String(input.value).trim() : "";
+    if (!value) return "";
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
   }
 
   function statusText() {
@@ -2994,10 +3283,6 @@
     const progressPercent = duration > 0 && watchProgress > 0 ? Math.min(100, watchProgress / duration * 100) : 0;
     return el("div", { className: "cover-wrap" }, [
       coverNode(video, "cover"),
-      Number(video && video.viewCount) >= 0 ? el("span", { className: "view-count-badge" }, [
-        iconNode("play"),
-        el("span", { textContent: formatViewCount(video.viewCount) })
-      ]) : null,
       duration ? el("span", {
         className: "duration-badge",
         textContent: watchProgress > 0 ? formatDuration(watchProgress) + "/" + formatDuration(duration) : formatDuration(duration)
@@ -3008,6 +3293,47 @@
     ].filter(Boolean));
   }
 
+  function renderMetricStats(video) {
+    const stats = metricDefinitions().map(([field, label, className, icon]) => {
+      const value = field === "likeRate" ? likeRateValue(video) : video && video[field];
+      if (!hasMetricCount(value)) return null;
+      const formatted = field === "likeRate" ? formatLikeRate(value) : formatMetricCount(value);
+      return el("span", {
+        className: "card-stat " + className,
+        title: label,
+        "aria-label": label + " " + formatted
+      }, [
+        iconNode(icon),
+        el("span", { textContent: formatted })
+      ]);
+    }).filter(Boolean);
+    return stats.length ? el("div", { className: "card-stats" }, stats) : null;
+  }
+
+  function metricDefinitions() {
+    return [
+      ["viewCount", "播放量", "view-count-badge", "play"],
+      ["likeCount", "点赞数", "like-count-badge", "heart"],
+      ["replyCount", "评论数", "reply-count-badge", "comment"],
+      ["favoriteCount", "收藏数", "favorite-count-badge", "star"],
+      ["coinCount", "投币数", "coin-count-badge", "coin"],
+      ["danmakuCount", "弹幕数", "danmaku-count-badge", "message"],
+      ["shareCount", "转发数", "share-count-badge", "share"],
+      ["likeRate", "点赞率", "like-rate-badge", "percent"]
+    ];
+  }
+
+  function hasMetricCount(value) {
+    return value != null && value !== "" && Number.isFinite(Number(value)) && Number(value) >= 0;
+  }
+
+  function likeRateValue(video) {
+    const viewCount = Number(video && video.viewCount);
+    const likeCount = video && video.likeCount;
+    if (!Number.isFinite(viewCount) || viewCount <= 0 || !hasMetricCount(likeCount)) return null;
+    return Number(likeCount) / viewCount * 100;
+  }
+
   function videoWatchProgress(video) {
     const duration = Number(video && video.duration) || 0;
     if (video && video.isWatched && duration > 0) return duration;
@@ -3016,11 +3342,18 @@
     return duration > 0 ? Math.min(progress, duration) : progress;
   }
 
-  function formatViewCount(value) {
+  function formatMetricCount(value) {
     const count = Math.max(0, Number(value) || 0);
     if (count >= 100000000) return trimCount(count / 100000000) + "亿";
     if (count >= 10000) return trimCount(count / 10000) + "万";
     return Math.floor(count).toLocaleString("zh-CN");
+  }
+
+  function formatLikeRate(value) {
+    const rate = Number(value);
+    if (!Number.isFinite(rate) || rate < 0) return "";
+    if (rate > 0 && rate < 0.1) return "<0.1%";
+    return rate.toFixed(1).replace(/\.0$/, "") + "%";
   }
 
   function trimCount(value) {
@@ -3167,12 +3500,6 @@
     return Boolean(node && node.checked);
   }
 
-  function manualExportLimit() {
-    const number = Number(valueByRole("manual-export-limit"));
-    if (!Number.isFinite(number)) return state.settings.manualExportLimit == null ? state.settings.batchSize || 80 : state.settings.manualExportLimit;
-    return Math.min(500, Math.max(0, Math.floor(number)));
-  }
-
   function categoryStyle(category, kind) {
     const color = categoryColor(category);
     if (kind === "swatch") return "background:" + color.accent + ";";
@@ -3251,6 +3578,54 @@
         ["rect", Object.assign({ x: "3.5", y: "5.5", width: "17", height: "13", rx: "3" }, commonStroke)],
         ["path", { d: "m10 9 5 3-5 3Z", fill: "currentColor" }]
       ],
+      heart: [
+        ["path", Object.assign({ d: "M20.8 8.8c0 5.5-8.8 10.4-8.8 10.4S3.2 14.3 3.2 8.8A4.8 4.8 0 0 1 12 5.5a4.8 4.8 0 0 1 8.8 3.3Z" }, commonStroke)]
+      ],
+      message: [
+        ["path", Object.assign({ d: "M5 5.5h14A1.5 1.5 0 0 1 20.5 7v7A1.5 1.5 0 0 1 19 15.5h-8l-4.5 3v-3H5A1.5 1.5 0 0 1 3.5 14V7A1.5 1.5 0 0 1 5 5.5Z" }, commonStroke)]
+      ],
+      coin: [
+        ["circle", Object.assign({ cx: "12", cy: "12", r: "8.5" }, commonStroke)],
+        ["path", Object.assign({ d: "M12 7.5v9M9.5 10.5h4a2 2 0 0 1 0 4h-4" }, commonStroke)]
+      ],
+      star: [
+        ["path", Object.assign({ d: "m12 3.8 2.5 5.1 5.7.8-4.1 4 1 5.7-5.1-2.7-5.1 2.7 1-5.7-4.1-4 5.7-.8Z" }, commonStroke)]
+      ],
+      share: [
+        ["circle", Object.assign({ cx: "6", cy: "12", r: "2" }, commonStroke)],
+        ["circle", Object.assign({ cx: "18", cy: "6", r: "2" }, commonStroke)],
+        ["circle", Object.assign({ cx: "18", cy: "18", r: "2" }, commonStroke)],
+        ["path", Object.assign({ d: "m7.8 11 8.4-4M7.8 13l8.4 4" }, commonStroke)]
+      ],
+      comment: [
+        ["path", Object.assign({ d: "M5 5.5h14A1.5 1.5 0 0 1 20.5 7v7A1.5 1.5 0 0 1 19 15.5h-8l-4.5 3v-3H5A1.5 1.5 0 0 1 3.5 14V7A1.5 1.5 0 0 1 5 5.5Z" }, commonStroke)],
+        ["circle", { cx: "8", cy: "10.5", r: "1", fill: "currentColor" }],
+        ["circle", { cx: "12", cy: "10.5", r: "1", fill: "currentColor" }],
+        ["circle", { cx: "16", cy: "10.5", r: "1", fill: "currentColor" }]
+      ],
+      percent: [
+        ["path", Object.assign({ d: "M7 17 17 7" }, commonStroke)],
+        ["circle", Object.assign({ cx: "7.5", cy: "7.5", r: "1.5" }, commonStroke)],
+        ["circle", Object.assign({ cx: "16.5", cy: "16.5", r: "1.5" }, commonStroke)]
+      ],
+      grid: [
+        ["rect", Object.assign({ x: "4", y: "4", width: "6", height: "6", rx: "1" }, commonStroke)],
+        ["rect", Object.assign({ x: "14", y: "4", width: "6", height: "6", rx: "1" }, commonStroke)],
+        ["rect", Object.assign({ x: "4", y: "14", width: "6", height: "6", rx: "1" }, commonStroke)],
+        ["rect", Object.assign({ x: "14", y: "14", width: "6", height: "6", rx: "1" }, commonStroke)]
+      ],
+      list: [
+        ["path", Object.assign({ d: "M9 6h11M9 12h11M9 18h11" }, commonStroke)],
+        ["circle", Object.assign({ cx: "4.5", cy: "6", r: "1" }, commonStroke)],
+        ["circle", Object.assign({ cx: "4.5", cy: "12", r: "1" }, commonStroke)],
+        ["circle", Object.assign({ cx: "4.5", cy: "18", r: "1" }, commonStroke)]
+      ],
+      "chevron-down": [
+        ["path", Object.assign({ d: "m6.5 9.5 5.5 5 5.5-5" }, commonStroke)]
+      ],
+      "chevron-right": [
+        ["path", Object.assign({ d: "m9.5 6.5 5 5.5-5 5.5" }, commonStroke)]
+      ],
       spinner: [
         ["circle", Object.assign({ cx: "12", cy: "12", r: "8.2", opacity: ".25" }, commonStroke)],
         ["path", Object.assign({ d: "M12 3.8a8.2 8.2 0 0 1 8.2 8.2" }, commonStroke)]
@@ -3327,6 +3702,7 @@
       else if (key === "textContent") node.textContent = value;
       else if (key === "dataset") Object.entries(value || {}).forEach(([dataKey, dataValue]) => { node.dataset[dataKey] = dataValue; });
       else if (key === "checked") node.checked = Boolean(value);
+      else if (key === "disabled") node.disabled = Boolean(value);
       else if (key === "selected") node.selected = Boolean(value);
       else if (key === "value") node.value = value;
       else if (key === "placeholder") node.placeholder = value;

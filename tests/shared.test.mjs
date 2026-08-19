@@ -47,10 +47,54 @@ test("extension version is consistent across manifests", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
-  assert.equal(core.EXTENSION_VERSION, "1.1.6");
+  assert.equal(core.EXTENSION_VERSION, "1.1.28");
   assert.equal(manifest.version, core.EXTENSION_VERSION);
   assert.equal(pkg.version, core.EXTENSION_VERSION);
-  assert.match(readme, /当前版本：1\.1\.6/);
+  assert.match(readme, /当前版本：1\.1\.28/);
+});
+
+test("batch mode exposes private favorite folder creation and Bilibili API wiring", () => {
+  const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
+  const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
+  assert.equal(core.MESSAGE_TYPES.CREATE_FAVORITE_FOLDER_AND_ADD, "CREATE_FAVORITE_FOLDER_AND_ADD");
+  assert.match(dashboard, /renderFavoriteFolderPanel/);
+  assert.match(dashboard, /favorite-folder-title/);
+  assert.match(dashboard, /CREATE_FAVORITE_FOLDER_AND_ADD/);
+  assert.match(dashboard, /当前选择 " \+ selectedBvids\.size/);
+  assert.match(background, /CREATE_FAVORITE_FOLDER_AND_ADD:[\s\S]*?createFavoriteFolderAndAdd\(message\)/);
+  assert.match(background, /x\/v3\/fav\/folder\/add/);
+  assert.match(background, /title, intro: "", privacy: "1", csrf/);
+  assert.match(background, /x\/v3\/fav\/resource\/deal/);
+  assert.match(background, /rid: String\(aid\)/);
+  assert.match(background, /add_media_ids: String\(mediaId\)/);
+  assert.match(background, /fetchVideoDetails\(bvid\)/);
+  assert.match(background, /findBiliPageTab/);
+  assert.match(background, /chrome\.scripting\.executeScript/);
+  assert.equal(manifest.permissions.includes("cookies"), true);
+  assert.equal(manifest.permissions.includes("tabs"), true);
+  assert.equal(manifest.permissions.includes("scripting"), true);
+  assert.match(css, /\.favorite-panel/);
+  assert.match(css, /\.favorite-form/);
+});
+
+test("video cards omit the AI source badge while retaining other source badges", () => {
+  const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
+  const cardStart = dashboard.indexOf("function renderVideoCard");
+  const cardEnd = dashboard.indexOf("function renderCover", cardStart);
+  const cardSource = dashboard.slice(cardStart, cardEnd);
+  assert.match(cardSource, /sourceType !== core\.CLASSIFICATION_SOURCE_TYPES\.LLM/);
+  assert.match(cardSource, /sourceLabel\(sourceType\)/);
+});
+
+test("collapsed category ids default to expanded and normalize safely", () => {
+  assert.deepEqual(Array.from(core.DEFAULT_SETTINGS.collapsedCategoryIds), []);
+  assert.deepEqual(
+    Array.from(core.normalizeCollapsedCategoryIds([" study ", "", "study", "tech", 42, null])),
+    ["study", "tech"]
+  );
+  assert.deepEqual(Array.from(core.normalizeCollapsedCategoryIds("study")), []);
 });
 
 test("data backup payloads are versioned and normalized", () => {
@@ -58,7 +102,13 @@ test("data backup payloads are versioned and normalized", () => {
   const backup = background.normalizeDataBackup(JSON.stringify({
     format: core.DATA_BACKUP_FORMAT,
     version: core.DATA_BACKUP_VERSION,
-    settings: { llmModel: "test-model", ignored: "value" },
+    settings: {
+      llmModel: "test-model",
+      categorySampleLimit: 1000,
+      videoViewMode: "list",
+      collapsedCategoryIds: ["study", "", "study", 42],
+      ignored: "value"
+    },
     categories: core.DEFAULT_CATEGORIES,
     videos: [],
     classifications: [],
@@ -66,9 +116,54 @@ test("data backup payloads are versioned and normalized", () => {
     meta: []
   }));
   assert.equal(backup.settings.llmModel, "test-model");
+  assert.equal(backup.settings.categorySampleLimit, 1000);
+  assert.equal(backup.settings.videoViewMode, core.VIDEO_VIEW_MODES.LIST);
+  assert.deepEqual(Array.from(backup.settings.collapsedCategoryIds), ["study"]);
+  assert.equal(core.DEFAULT_SETTINGS.browseMode, core.BROWSE_MODES.CATEGORIES);
+  assert.equal(Object.prototype.hasOwnProperty.call(backup.settings, "browseMode"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(backup.settings, "ignored"), false);
   assert.equal(backup.categories.some((category) => category.id === "other.todo"), true);
   assert.throws(() => background.normalizeDataBackup({ format: "unknown", version: 1, categories: core.DEFAULT_CATEGORIES }), /不是稍后再看整理助手/);
+
+  const upBackup = background.normalizeBackupSettings({ browseMode: "up" });
+  assert.equal(upBackup.browseMode, core.BROWSE_MODES.UP);
+  assert.equal(Object.prototype.hasOwnProperty.call(background.normalizeBackupSettings({ browseMode: "invalid" }), "browseMode"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(background.normalizeBackupSettings({ videoViewMode: "invalid" }), "videoViewMode"), false);
+
+  const legacyBackup = background.normalizeDataBackup({
+    format: core.DATA_BACKUP_FORMAT,
+    version: core.DATA_BACKUP_VERSION,
+    categories: core.DEFAULT_CATEGORIES,
+    videos: [],
+    classifications: [],
+    jobs: [],
+    meta: []
+  });
+  assert.deepEqual(Array.from(legacyBackup.settings.collapsedCategoryIds), []);
+});
+
+test("category sample limit keeps the default and accepts values above the old cap", () => {
+  assert.equal(core.DEFAULT_SETTINGS.categorySampleLimit, 60);
+  assert.equal(core.normalizeCategorySampleLimit(1000, 60), 1000);
+  assert.equal(core.normalizeCategorySampleLimit(0, 60), 60);
+  assert.equal(core.normalizeCategorySampleLimit("invalid", 60), 60);
+});
+
+test("video view mode defaults to cards and normalizes invalid values", () => {
+  assert.equal(core.DEFAULT_SETTINGS.videoViewMode, core.VIDEO_VIEW_MODES.CARDS);
+  assert.equal(core.normalizeVideoViewMode(core.VIDEO_VIEW_MODES.LIST), core.VIDEO_VIEW_MODES.LIST);
+  assert.equal(core.normalizeVideoViewMode("invalid"), core.VIDEO_VIEW_MODES.CARDS);
+});
+
+test("legacy manual category-generation onboarding state migrates to API setup", () => {
+  const background = loadBackgroundHelpers();
+  const settings = { onboardingStage: "setup-prompt", onboardingMethod: "prompt" };
+  background.migrateOnboardingSettings(settings);
+  assert.equal(settings.onboardingStage, "setup-api");
+  assert.equal(settings.onboardingMethod, "api");
+  const normalized = background.normalizeBackupSettings({ onboardingStage: "setup-prompt", onboardingMethod: "prompt" });
+  assert.equal(normalized.onboardingStage, "setup-api");
+  assert.equal(normalized.onboardingMethod, "api");
 });
 
 test("data backup wiring covers storage snapshots and dashboard file actions", () => {
@@ -269,7 +364,13 @@ test("canonicalizeVideo preserves watchlater order when details update", () => {
     bvid: "BV1xx411c7mD",
     title: "旧标题",
     watchlaterOrder: 12,
-    watchlaterAddedAt: 1700000000
+    watchlaterAddedAt: 1700000000,
+    danmakuCount: 12,
+    likeCount: 321,
+    coinCount: 8,
+    favoriteCount: 19,
+    shareCount: 3,
+    replyCount: 27
   }, null, { now: 1 });
   const updated = core.canonicalizeVideo({
     bvid: "BV1xx411c7mD",
@@ -278,22 +379,98 @@ test("canonicalizeVideo preserves watchlater order when details update", () => {
   }, existing, { now: 2 });
   assert.equal(updated.watchlaterOrder, 12);
   assert.equal(updated.watchlaterAddedAt, 1700000000);
+  assert.equal(updated.danmakuCount, 12);
+  assert.equal(updated.likeCount, 321);
+  assert.equal(updated.coinCount, 8);
+  assert.equal(updated.favoriteCount, 19);
+  assert.equal(updated.shareCount, 3);
+  assert.equal(updated.replyCount, 27);
   assert.equal(updated.pubdate, 1600000000);
 });
 
-test("watchlater video fields preserve views and normalize finished progress", () => {
+test("watchlater video fields preserve all popularity stats and normalize finished progress", () => {
   const helpers = loadBackgroundHelpers();
   const converted = helpers.convertBiliApiVideo({
     bvid: "BV1xx411c7mD",
     title: "测试视频",
     duration: 600,
     progress: -1,
-    stat: { view: 17234 }
+    stat: { view: 17234, danmaku: 91, like: 428, coin: 33, favorite: 66, share: 7, reply: 12 }
   }, 0);
   const video = core.canonicalizeVideo(converted, null, { now: 1 });
   assert.equal(video.viewCount, 17234);
+  assert.equal(video.danmakuCount, 91);
+  assert.equal(video.likeCount, 428);
+  assert.equal(video.coinCount, 33);
+  assert.equal(video.favoriteCount, 66);
+  assert.equal(video.shareCount, 7);
+  assert.equal(video.replyCount, 12);
   assert.equal(video.watchProgress, 600);
   assert.equal(video.isWatched, true);
+});
+
+test("video details keep popularity fields and queue legacy videos missing likes", () => {
+  const helpers = loadBackgroundHelpers();
+  assert.equal(helpers.shouldFetchDetails({
+    viewCount: 17234,
+    likeCount: null,
+    tname: "科技",
+    desc: "简介",
+    tags: ["标签"]
+  }), true);
+  assert.equal(helpers.shouldFetchDetails({
+    viewCount: 17234,
+    danmakuCount: 91,
+    likeCount: 428,
+    coinCount: 33,
+    favoriteCount: 66,
+    shareCount: 7,
+    replyCount: 12,
+    tname: "科技",
+    desc: "简介",
+    tags: ["标签"],
+    upName: "测试 UP主",
+    pageParts: ["正片"]
+  }), false);
+  assert.equal(helpers.shouldFetchDetails({
+    viewCount: 17234,
+    danmakuCount: 91,
+    likeCount: 428,
+    coinCount: 33,
+    favoriteCount: 66,
+    shareCount: 7,
+    replyCount: 12,
+    tname: "科技",
+    desc: "简介",
+    tags: ["标签"],
+    upName: "",
+    pageParts: ["正片"]
+  }), true);
+  assert.equal(helpers.shouldFetchDetails({
+    viewCount: 17234,
+    danmakuCount: 91,
+    likeCount: 428,
+    coinCount: 33,
+    favoriteCount: 66,
+    shareCount: 7,
+    replyCount: 12,
+    tname: "科技",
+    desc: "简介",
+    tags: ["标签"],
+    upName: "测试 UP主",
+    pageParts: []
+  }), true);
+  const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  [
+    "viewCount: stat.view",
+    "danmakuCount: stat.danmaku",
+    "likeCount: stat.like",
+    "coinCount: stat.coin",
+    "favoriteCount: stat.favorite",
+    "shareCount: stat.share",
+    "replyCount: stat.reply"
+  ].forEach((field) => assert.match(background, new RegExp(field)));
+  assert.match(background, /const stat = \(videoData && videoData\.stat\) \|\| \{\}/);
 });
 
 test("watchlater partial progress survives a later detail-only update", () => {
@@ -447,6 +624,126 @@ test("matchesFilter handles unclassified and category filters", () => {
   assert.equal(core.matchesFilter(video, { categoryIds: ["tech.ai.llm"] }, { categoryIds: ["life.food"] }), false);
 });
 
+test("duration filters cover preset boundaries, custom ranges and unknown duration", () => {
+  const presets = core.DURATION_FILTER_PRESETS;
+  const underTen = { bvid: "BV1duration01", duration: 599, presentInWatchlater: true };
+  const ten = { bvid: "BV1duration02", duration: 600, presentInWatchlater: true };
+  const thirty = { bvid: "BV1duration03", duration: 1800, presentInWatchlater: true };
+  const sixty = { bvid: "BV1duration04", duration: 3600, presentInWatchlater: true };
+  const unknown = { bvid: "BV1duration05", duration: 0, presentInWatchlater: true };
+
+  assert.equal(core.durationFilterMatches(underTen, { durationPreset: presets.UNDER_10 }), true);
+  assert.equal(core.durationFilterMatches(ten, { durationPreset: presets.UNDER_10 }), false);
+  assert.equal(core.durationFilterMatches(ten, { durationPreset: presets.FROM_10_TO_30 }), true);
+  assert.equal(core.durationFilterMatches(thirty, { durationPreset: presets.FROM_10_TO_30 }), false);
+  assert.equal(core.durationFilterMatches(thirty, { durationPreset: presets.FROM_30_TO_60 }), true);
+  assert.equal(core.durationFilterMatches(sixty, { durationPreset: presets.OVER_60 }), true);
+  assert.equal(core.durationFilterMatches(unknown, { durationPreset: presets.UNKNOWN }), true);
+  assert.equal(core.durationFilterMatches(unknown, { durationPreset: presets.UNDER_10 }), false);
+  assert.equal(core.durationFilterMatches(ten, { durationPreset: presets.CUSTOM, durationMin: 10, durationMax: 10 }), true);
+  assert.equal(core.durationFilterMatches(underTen, { durationPreset: presets.CUSTOM, durationMin: 10 }), false);
+  assert.equal(core.durationFilterMatches(sixty, { durationPreset: presets.CUSTOM, durationMax: 59.9 }), false);
+});
+
+test("duration filters combine with existing classification filters", () => {
+  const presets = core.DURATION_FILTER_PRESETS;
+  const video = { bvid: "BV1duration06", duration: 1200, presentInWatchlater: true };
+  const classification = { categoryIds: ["tech"], sourceType: "keyword" };
+  assert.equal(core.matchesFilter(video, classification, {
+    categoryIds: ["tech"],
+    durationPreset: presets.FROM_10_TO_30
+  }), true);
+  assert.equal(core.matchesFilter(video, classification, {
+    includeUnclassified: true,
+    durationPreset: presets.OVER_60
+  }), false);
+});
+
+test("watch progress filters distinguish not started, in progress and completed videos", () => {
+  const presets = core.WATCH_PROGRESS_FILTER_PRESETS;
+  const notStarted = { bvid: "BV1progress01", duration: 600, watchProgress: 0, isWatched: false, presentInWatchlater: true };
+  const missingProgress = { bvid: "BV1progress02", duration: 600, presentInWatchlater: true };
+  const inProgress = { bvid: "BV1progress03", duration: 600, watchProgress: 1, isWatched: false, presentInWatchlater: true };
+  const atEnd = { bvid: "BV1progress04", duration: 600, watchProgress: 600, isWatched: false, presentInWatchlater: true };
+  const markedWatched = { bvid: "BV1progress05", duration: 600, watchProgress: 120, isWatched: true, presentInWatchlater: true };
+  const unknownDuration = { bvid: "BV1progress06", watchProgress: 0, isWatched: false, presentInWatchlater: true };
+
+  assert.equal(core.watchProgressFilterMatches(notStarted, { watchProgressPreset: presets.NOT_STARTED }), true);
+  assert.equal(core.watchProgressFilterMatches(missingProgress, { watchProgressPreset: presets.NOT_STARTED }), true);
+  assert.equal(core.watchProgressFilterMatches(inProgress, { watchProgressPreset: presets.NOT_STARTED }), false);
+  assert.equal(core.watchProgressFilterMatches(inProgress, { watchProgressPreset: presets.IN_PROGRESS }), true);
+  assert.equal(core.watchProgressFilterMatches(atEnd, { watchProgressPreset: presets.IN_PROGRESS }), false);
+  assert.equal(core.watchProgressFilterMatches(atEnd, { watchProgressPreset: presets.COMPLETED }), true);
+  assert.equal(core.watchProgressFilterMatches(markedWatched, { watchProgressPreset: presets.COMPLETED }), true);
+  assert.equal(core.watchProgressFilterMatches(unknownDuration, { watchProgressPreset: presets.NOT_STARTED }), false);
+  assert.equal(core.watchProgressFilterMatches(unknownDuration, { watchProgressPreset: presets.ALL }), true);
+});
+
+test("watch progress filters combine with existing classification filters", () => {
+  const video = { bvid: "BV1progress07", duration: 1200, watchProgress: 600, presentInWatchlater: true };
+  const classification = { categoryIds: ["tech"], sourceType: "keyword" };
+  assert.equal(core.matchesFilter(video, classification, {
+    categoryIds: ["tech"],
+    watchProgressPreset: core.WATCH_PROGRESS_FILTER_PRESETS.IN_PROGRESS
+  }), true);
+  assert.equal(core.matchesFilter(video, classification, {
+    categoryIds: ["tech"],
+    watchProgressPreset: core.WATCH_PROGRESS_FILTER_PRESETS.NOT_STARTED
+  }), false);
+});
+
+test("UP groups use stable mids and merge all single-video UPs", () => {
+  const videos = [
+    { bvid: "BV1aa411c7mA", upMid: 100, upName: "同名 UP", presentInWatchlater: true },
+    { bvid: "BV1ab411c7mB", upMid: "100", upName: "改过的名称", presentInWatchlater: true },
+    { bvid: "BV1ac411c7mC", upMid: 200, upName: "同名 UP", presentInWatchlater: true },
+    { bvid: "BV1ad411c7mD", upMid: 201, upName: "另一个单视频 UP", presentInWatchlater: true },
+    { bvid: "BV1ae411c7mE", upName: "  无 ID 作者  ", presentInWatchlater: true },
+    { bvid: "BV1af411c7mF", upName: "无 ID 作者", presentInWatchlater: true },
+    { bvid: "BV1ag411c7mG", presentInWatchlater: true },
+    { bvid: "BV1ah411c7mH", upMid: 999, upName: "已移出", presentInWatchlater: false }
+  ];
+
+  assert.equal(core.upGroupKey(videos[0]), "mid:100");
+  assert.equal(core.upGroupKey(videos[4]), "name:无 ID 作者");
+  assert.equal(core.upGroupKey(videos[6]), core.UNKNOWN_UP_GROUP_KEY);
+  assert.equal(core.upGroupName(videos[6]), core.UNKNOWN_UP_NAME);
+  assert.equal(core.browseUpGroupKey(videos[2], videos), core.SINGLE_VIDEO_UP_GROUP_KEY);
+  assert.equal(core.browseUpGroupKey(videos[6], videos), core.UNKNOWN_UP_GROUP_KEY);
+
+  const groups = core.upGroups(videos);
+  const groupSummary = Array.from(groups, (group) => ({ key: group.key, name: group.name, count: group.count }));
+  const singleGroup = groupSummary.find((group) => group.key === core.SINGLE_VIDEO_UP_GROUP_KEY);
+  assert.deepEqual(singleGroup, { key: core.SINGLE_VIDEO_UP_GROUP_KEY, name: core.SINGLE_VIDEO_UP_GROUP_NAME, count: 2 });
+  assert.equal(groupSummary.some((group) => group.key === "mid:200"), false);
+  assert.equal(groupSummary.find((group) => group.key === "mid:100").count, 2);
+  assert.equal(groupSummary.find((group) => group.key === "name:无 ID 作者").count, 2);
+  assert.equal(groupSummary.find((group) => group.key === core.UNKNOWN_UP_GROUP_KEY).count, 1);
+  assert.equal(groupSummary.length, 4);
+});
+
+test("matchesFilter supports UP group keys without changing pending and removed semantics", () => {
+  const pending = { bvid: "BV1ah411c7mH", upMid: 300, upName: "筛选 UP", presentInWatchlater: true };
+  const manual = { bvid: "BV1ai411c7mI", upMid: 300, upName: "筛选 UP", presentInWatchlater: true };
+  const other = { bvid: "BV1aj411c7mJ", upMid: 301, upName: "其他 UP", presentInWatchlater: true };
+  const removed = { bvid: "BV1ak411c7mK", upMid: 300, upName: "筛选 UP", presentInWatchlater: false };
+  const upFilter = { upGroupKey: core.upGroupKey(pending) };
+
+  assert.equal(core.matchesFilter(pending, null, Object.assign({}, upFilter, { includeUnclassified: true })), true);
+  assert.equal(core.matchesFilter(manual, { sourceType: "manual", categoryIds: ["study"] }, Object.assign({}, upFilter, { includeUnclassified: true })), false);
+  assert.equal(core.matchesFilter(other, null, upFilter), false);
+  assert.equal(core.matchesFilter(removed, null, upFilter), false);
+  assert.equal(core.matchesFilter(removed, null, Object.assign({}, upFilter, { includeRemoved: true })), true);
+
+  const singleVideos = [
+    { bvid: "BV1al411c7mL", upMid: 400, upName: "单视频甲", presentInWatchlater: true },
+    { bvid: "BV1am411c7mM", upMid: 401, upName: "单视频乙", presentInWatchlater: true }
+  ];
+  const singleFilter = { upGroupKey: core.SINGLE_VIDEO_UP_GROUP_KEY };
+  assert.equal(core.matchesFilter(singleVideos[0], null, singleFilter, singleVideos), true);
+  assert.equal(core.matchesFilter(singleVideos[1], null, singleFilter, singleVideos), true);
+});
+
 test("categoryIdFromName creates stable ids under parent", () => {
   assert.equal(core.categoryIdFromName("", "研究", core.DEFAULT_CATEGORIES), "研究");
   const id = core.categoryIdFromName("entertainment", "个人影单", core.DEFAULT_CATEGORIES);
@@ -570,17 +867,100 @@ test("compact first-run prompt only includes bvid and title", () => {
   assert.equal(prompt.includes("只提供标题"), true);
 });
 
-test("category proposal prompt updates the category list instead of classifying videos", () => {
+test("classification prompt includes category keywords for AI guidance", () => {
+  const prompt = core.buildClassificationPrompt([
+    { bvid: "BV1xx411c7mD", title: "人工智能入门" }
+  ], [{
+    id: "tech.ai",
+    name: "人工智能",
+    keywords: ["机器学习", "大模型"]
+  }], {});
+  assert.equal(prompt.includes("完整层级路径和可选关键词"), true);
+  assert.equal(prompt.includes("tech.ai = 人工智能；关键词：机器学习、大模型"), true);
+});
+
+test("classification validation only accepts BVIDs from the current AI batch", () => {
+  const targetBvid = "BV1xx411c7mD";
+  const otherBvid = "BV1yy411c7mE";
+  const result = core.validateClassificationItems([
+    { bvid: targetBvid, categoryIds: ["tech"] },
+    { bvid: otherBvid, categoryIds: ["tech"] }
+  ], core.DEFAULT_CATEGORIES, [{ bvid: targetBvid }, { bvid: otherBvid }], {
+    expectedBvids: [targetBvid]
+  });
+  assert.deepEqual(Array.from(result.items, (item) => item.bvid), [targetBvid]);
+  assert.equal(result.warnings.some((warning) => warning.includes("不属于当前 AI 批次")), true);
+});
+
+test("category proposal prompt includes video metadata without local usage data", () => {
   const prompt = core.buildCategoryProposalPrompt([
-    { bvid: "BV1xx411c7mD", title: "木工榫卯入门教程", desc: "不应发送的简介" },
+    {
+      bvid: "BV1xx411c7mD",
+      title: "木工榫卯入门教程",
+      upName: "木作研究所",
+      tname: "知识",
+      tags: ["木工", "教程"],
+      desc: "用于设计分类的简介",
+      duration: 123,
+      pageParts: ["第一集", "第二集"],
+      viewCount: "不应发送的播放量",
+      likeCount: "不应发送的点赞数",
+      watchProgress: 88,
+      isWatched: false,
+      watchlaterOrder: 7,
+      categoryIds: ["private"],
+      classificationReason: "不应发送的分类原因"
+    },
     { bvid: "BV1yy411c7mE", title: "独立游戏开发记录" }
   ], core.DEFAULT_CATEGORIES, { sampleLimit: 20 });
   assert.equal(prompt.includes("生成并替换可选分类目录，不是给每个视频分配分类"), true);
+  assert.equal(prompt.includes("根据样本视频信息设计"), true);
   assert.equal(prompt.includes("\"categories\""), true);
   assert.equal(prompt.includes("keywords"), true);
   assert.equal(prompt.includes("木工榫卯入门教程"), true);
+  assert.equal(prompt.includes("木作研究所"), true);
+  assert.equal(prompt.includes("知识"), true);
+  assert.equal(prompt.includes("木工"), true);
+  assert.equal(prompt.includes("用于设计分类的简介"), true);
+  assert.match(prompt, /"duration": 123/);
+  assert.equal(prompt.includes("第一集"), true);
   assert.equal(prompt.includes("BV1xx411c7mD"), false);
-  assert.equal(prompt.includes("不应发送的简介"), false);
+  assert.equal(prompt.includes("不应发送的播放量"), false);
+  assert.equal(prompt.includes("不应发送的点赞数"), false);
+  assert.equal(prompt.includes("不应发送的分类原因"), false);
+});
+
+test("category proposal prompt bounds the metadata sample size", () => {
+  const prompt = core.buildCategoryProposalPrompt([{
+    title: "标题".repeat(80),
+    upName: "UP".repeat(30),
+    tname: "分区".repeat(20),
+    tags: Array.from({ length: 14 }, (_, index) => "标签" + index),
+    desc: "简介".repeat(200),
+    duration: "321",
+    pageParts: Array.from({ length: 10 }, (_, index) => "第" + index + "P")
+  }], [], { sampleLimit: 1 });
+  const marker = "现有稍后再看视频信息样本：\n";
+  const rows = JSON.parse(prompt.slice(prompt.indexOf(marker) + marker.length));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].title.length, 120);
+  assert.equal(rows[0].title.endsWith("…"), true);
+  assert.equal(rows[0].upName.length, 40);
+  assert.equal(rows[0].tname.length, 30);
+  assert.equal(rows[0].tags.length, 12);
+  assert.equal(rows[0].desc.length, 280);
+  assert.equal(rows[0].pageParts.length, 8);
+  assert.equal(rows[0].duration, 321);
+});
+
+test("category proposal flow reads the persisted sample setting without a fixed upper cap", () => {
+  const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
+  assert.match(background, /config\.settings\.categorySampleLimit/);
+  assert.match(background, /normalizeCategorySampleLimit/);
+  assert.match(dashboard, /category-sample-limit/);
+  assert.doesNotMatch(background, /Math\.min\(100, Math\.max\(10, Number\(message\.limit\) \|\| 60\)\)/);
+  assert.doesNotMatch(dashboard, /EXPORT_CATEGORY_PROPOSAL, limit: 60/);
 });
 
 test("custom category keywords participate in local video classification", () => {
@@ -643,14 +1023,24 @@ test("background scan only fills unclassified videos and does not auto queue det
 test("dashboard consolidates AI classification, category generation and API settings", () => {
   const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
+  const shared = readFileSync(new URL("../src/shared.js", import.meta.url), "utf8");
+  assert.match(dashboard, /browse-mode-switch/);
+  assert.match(dashboard, /按分类目录/);
+  assert.match(dashboard, /按 UP 主/);
+  assert.match(dashboard, /set-browse-mode/);
+  assert.match(dashboard, /renderUpTree/);
+  assert.match(dashboard, /upGroupKey/);
+  assert.match(dashboard, /core\.upGroups/);
+  assert.match(dashboard, /currentVideos/);
+  assert.match(shared, /SINGLE_VIDEO_UP_GROUP_KEY/);
+  assert.match(shared, /单视频 UP 主/);
   assert.match(dashboard, /sort-combo/);
   assert.match(dashboard, /添加时间-降序/);
   assert.match(dashboard, /添加时间-升序/);
   assert.match(dashboard, /sync-refresh/);
   assert.match(dashboard, /AI 批量视频分类/);
-  assert.match(dashboard, /手动导入\/导出/);
   assert.match(dashboard, /使用 API 生成/);
-  assert.match(dashboard, /手动复制 Prompt/);
+  assert.match(dashboard, /category-sample-limit/);
   assert.match(dashboard, /测试 API/);
   assert.match(dashboard, /llm-api-format/);
   assert.match(dashboard, /textContent: "设置API"/);
@@ -658,11 +1048,33 @@ test("dashboard consolidates AI classification, category generation and API sett
   assert.match(dashboard, /toggle-api-settings/);
   assert.match(dashboard, /自动 API 视频分类/);
   assert.match(dashboard, /待精细分类达到指定数量/);
+  assert.match(dashboard, /视频时长/);
+  assert.match(dashboard, /duration-preset/);
+  assert.match(dashboard, /duration-min/);
+  assert.match(dashboard, /duration-max/);
+  assert.match(dashboard, /观看进度/);
+  assert.match(dashboard, /watch-progress-preset/);
+  const watchProgressChangeStart = dashboard.indexOf('role === "watch-progress-preset"');
+  const watchProgressChangeEnd = dashboard.indexOf('role === "category-sample-limit"');
+  assert.match(dashboard.slice(watchProgressChangeStart, watchProgressChangeEnd), /renderShell\(\)/);
+  const durationChangeStart = dashboard.indexOf('role === "duration-preset"');
+  const durationChangeEnd = dashboard.indexOf('role === "category-sample-limit"');
+  assert.match(dashboard.slice(durationChangeStart, durationChangeEnd), /renderShell\(\)/);
+  assert.match(dashboard, /view-switch/);
+  assert.match(dashboard, /卡片视图/);
+  assert.match(dashboard, /列表视图/);
+  assert.match(dashboard, /set-video-view/);
+  assert.match(dashboard, /videoViewSaveQueue/);
+  assert.match(dashboard, /videoViewMode/);
+  assert.match(css, /\.video-grid\.view-list/);
+  assert.match(css, /\.view-switch-button\.active/);
   assert.match(dashboard, /编辑分类目录/);
   assert.equal(dashboard.includes("手动编辑分类目录"), false);
-  assert.match(dashboard, /manual-export-limit/);
+  assert.doesNotMatch(dashboard, /手动导入\/导出|手动复制 Prompt|manual-export-limit/);
   assert.equal(dashboard.includes("keyword" + "判定"), false);
-  assert.match(css, /\.exchange-panel textarea/);
+  assert.match(css, /\.browse-mode-switch/);
+  assert.match(css, /\.browse-mode-button\.active/);
+  assert.doesNotMatch(css, /\.exchange-panel|\.category-prompt-editor/);
 });
 
 test("dashboard renders watch progress and reorders category subtrees without automatic sync", () => {
@@ -672,10 +1084,46 @@ test("dashboard renders watch progress and reorders category subtrees without au
   const reorderStart = background.indexOf("async function reorderCategory");
   const deleteStart = background.indexOf("async function deleteCategory");
   const reorderSource = background.slice(reorderStart, deleteStart);
-  assert.match(dashboard, /view-count-badge/);
+  [
+    "view-count-badge",
+    "danmaku-count-badge",
+    "like-count-badge",
+    "coin-count-badge",
+    "favorite-count-badge",
+    "share-count-badge",
+    "reply-count-badge"
+  ].forEach((className) => assert.match(dashboard, new RegExp(className)));
+  const metricDefinitionStart = dashboard.indexOf("function metricDefinitions");
+  const metricDefinitionEnd = dashboard.indexOf("function hasMetricCount", metricDefinitionStart);
+  const metricDefinitions = dashboard.slice(metricDefinitionStart, metricDefinitionEnd);
+  ["播放量", "点赞数", "评论数", "收藏数", "投币数", "弹幕数", "转发数", "点赞率"].forEach((label) => {
+    assert.match(metricDefinitions, new RegExp("\\\"" + label + "\\\""));
+  });
+  const expectedMetricOrder = ["播放量", "点赞数", "评论数", "收藏数", "投币数", "弹幕数", "转发数", "点赞率"];
+  let previousMetricPosition = -1;
+  expectedMetricOrder.forEach((label) => {
+    const position = metricDefinitions.indexOf('"' + label + '"');
+    assert.ok(position > previousMetricPosition, label + " 的顺序不正确");
+    previousMetricPosition = position;
+  });
+  assert.match(dashboard, /renderMetricStats/);
+  assert.match(dashboard, /card-stats/);
+  ["play", "message", "heart", "coin", "star", "share", "comment", "percent"].forEach((icon) => {
+    assert.match(metricDefinitions, new RegExp("\\\"" + icon + "\\\""));
+  });
+  assert.match(dashboard, /likeRateValue/);
+  assert.match(dashboard, /formatLikeRate/);
+  assert.match(dashboard, /viewCount\s*<=\s*0/);
   assert.match(dashboard, /watch-progress-value/);
   assert.match(dashboard, /formatDuration\(watchProgress\) \+ "\/" \+ formatDuration\(duration\)/);
   assert.match(dashboard, /category-tree-group/);
+  assert.match(dashboard, /category-row-layout/);
+  assert.match(dashboard, /toggle-category-collapse/);
+  assert.match(dashboard, /aria-expanded/);
+  assert.match(dashboard, /categoryCollapseSaveQueue/);
+  assert.match(dashboard, /if \(!collapsed\) appendCategoryLevel/);
+  assert.match(dashboard, /category-collapse-toggle/);
+  assert.match(dashboard, /category-collapse-toggle[\s\S]*?event\.preventDefault\(\)/);
   assert.match(dashboard, /categoryDropTargetGroup/);
   assert.match(dashboard, /event\.preventDefault\(\);[\s\S]*?categoryNav\.scrollTop \+= event\.deltaY/);
   assert.equal(dashboard.includes('syncAfterCategoryStructureChange("分类顺序已更新")'), false);
@@ -683,6 +1131,11 @@ test("dashboard renders watch progress and reorders category subtrees without au
   assert.match(reorderSource, /await getState\(\)/);
   assert.equal(reorderSource.includes("stateAfterCategoryAutoClassify"), false);
   assert.match(css, /\.category-tree-group\.drop-before::before/);
+  assert.match(css, /\.category-row-layout\.has-collapse-toggle/);
+  assert.match(css, /\.category-collapse-toggle\.is-collapsed/);
+  assert.match(css, /\.card-stats/);
+  assert.match(css, /\.card-stat/);
+  assert.match(css, /grid-template-columns: repeat\(4, minmax\(0, 1fr\)\)/);
   assert.match(css, /\.watch-progress-value/);
 });
 
@@ -709,20 +1162,25 @@ test("watchlater removal wiring is exposed in manifest background dashboard and 
   assert.equal(manifest.permissions.includes("tabs"), true);
   assert.equal(manifest.permissions.includes("scripting"), true);
   assert.equal(core.MESSAGE_TYPES.REMOVE_FROM_WATCHLATER, "REMOVE_FROM_WATCHLATER");
-  assert.equal(core.MESSAGE_TYPES.REMOVE_FROM_WATCHLATER_PAGE, "REMOVE_FROM_WATCHLATER_PAGE");
+  assert.equal(core.MESSAGE_TYPES.REMOVE_FROM_WATCHLATER_PAGE, undefined);
   assert.match(background, /REMOVE_FROM_WATCHLATER:[\s\S]*?removeFromWatchlater\(message\)/);
   assert.match(background, /x\/v2\/history\/toview\/del/);
   assert.match(background, /body\.set\("aid", String\(aid\)\)/);
   assert.match(background, /referrer: "https:\/\/www\.bilibili\.com\/"/);
   assert.match(background, /referrerPolicy: "strict-origin-when-cross-origin"/);
-  assert.match(background, /requestWatchlaterRemoveFromPage/);
+  assert.match(background, /async function requestWatchlaterRemove\(aid\)/);
+  assert.match(background, /await postWatchlaterRemove\(aid, csrf\)/);
+  assert.match(background, /shouldRetryBiliPageRequest\(error\)/);
+  assert.match(background, /requestBiliFormFromPage\(/);
+  assert.match(background, /x\/v2\/history\/toview\/del/);
+  assert.equal(background.includes("requestWatchlaterRemoveFromPage"), false);
+  assert.equal(background.includes("findWatchlaterTab"), false);
   assert.match(background, /chrome\.tabs\.query/);
   assert.match(background, /chrome\.scripting\.executeScript/);
   assert.match(background, /world: "MAIN"/);
   assert.match(background, /await waitForTabComplete\(tab\.id\)/);
-  assert.match(background, /B站删除\|HTTP 412/);
-  assert.match(content, /REMOVE_FROM_WATCHLATER_PAGE/);
-  assert.match(content, /removeFromWatchlaterOnPage/);
+  assert.equal(content.includes("REMOVE_FROM_WATCHLATER_PAGE"), false);
+  assert.equal(content.includes("removeFromWatchlaterOnPage"), false);
   assert.equal(background.includes("csrf_token"), false);
   assert.match(dashboard, /remove-watchlater/);
   assert.match(dashboard, /watchlaterPlaybackUrl/);
@@ -739,6 +1197,39 @@ test("watchlater removal wiring is exposed in manifest background dashboard and 
   assert.equal(dashboard.includes("普通打开"), false);
   assert.match(dashboard, /稍后合集中打开/);
   assert.match(idb, /async function markRemoved\(bvid\)/);
+});
+
+test("batch watchlater removal keeps local records and continues after item failures", () => {
+  const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
+  assert.equal(core.MESSAGE_TYPES.BULK_REMOVE_FROM_WATCHLATER, "BULK_REMOVE_FROM_WATCHLATER");
+  assert.match(background, /BULK_REMOVE_FROM_WATCHLATER:[\s\S]*?bulkRemoveFromWatchlater\(message\)/);
+  const batchSourceStart = background.indexOf("async function bulkRemoveFromWatchlater");
+  const batchSourceEnd = background.indexOf("async function createFavoriteFolderAndAdd", batchSourceStart);
+  const batchSource = background.slice(batchSourceStart, batchSourceEnd);
+  assert.match(batchSource, /Array\.isArray\(message && message\.bvids\)/);
+  assert.match(batchSource, /core\.normalizeBvid/);
+  assert.match(batchSource, /for \(const bvid of bvids\)/);
+  assert.match(batchSource, /fetchVideoDetails\(bvid\)/);
+  assert.match(batchSource, /requestWatchlaterRemove\(aid\)/);
+  assert.match(batchSource, /await db\.markRemoved\(bvid\)/);
+  assert.match(batchSource, /catch \(error\)/);
+  assert.match(batchSource, /failedItems\.push\(\{ bvid, reason: errorMessage\(error\) \}\)/);
+  assert.match(batchSource, /removedBvids/);
+  assert.match(batchSource, /successCount/);
+  assert.match(batchSource, /failureCount/);
+  assert.match(batchSource, /failedItems/);
+  assert.match(dashboard, /action: "bulk-remove-watchlater"/);
+  assert.match(dashboard, /disabled: batchOperationRunning \|\| !selectedBvids\.size/);
+  assert.match(dashboard, /批量移出稍后再看/);
+  assert.match(dashboard, /title: "批量移出稍后再看？"/);
+  assert.match(dashboard, /本地视频记录、分类结果和手动确认会保留/);
+  assert.match(dashboard, /bulkRemoveRun\.failed/);
+  assert.match(dashboard, /selectedBvids = new Set\(bvids\.filter\(\(bvid\) => !removed\.has\(bvid\)\)\)/);
+  assert.match(dashboard, /失败的视频仍保留在选择中，可以重试/);
+  assert.match(css, /\.batch-actions \.batch-remove-watchlater/);
+  assert.match(css, /\.batch-remove-result\.has-failures/);
 });
 
 test("manifest exposes blue extension icons and homepage dashboard entry", () => {
@@ -796,24 +1287,13 @@ test("background has one-time classification repair migration", () => {
   assert.equal(source.includes("includeManual: true"), false);
 });
 
-test("auto LLM script contains no committed API key and calls export/import messages", () => {
-  const source = readFileSync(new URL("../scripts/auto-llm-classify.js", import.meta.url), "utf8");
-  assert.match(source, /CONFIG/);
-  assert.match(source, /apiKey: "YOUR_API_KEY_HERE"/);
-  assert.equal(/sk-[A-Za-z0-9_-]{20,}/.test(source), false);
-  assert.match(source, /EXPORT_CLASSIFY_BATCH/);
-  assert.match(source, /IMPORT_CLASSIFICATIONS/);
-  assert.match(source, /RESET_FOR_LLM_RECLASSIFY/);
-  assert.match(source, /BiliWLAutoLlmClassify/);
-});
-
 test("dashboard exposes AI API batch video classification controls", () => {
   const source = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
   assert.match(source, /AI \(API\) 批量视频分类/);
   assert.match(source, /llm-base-url/);
   assert.match(source, /startLlmRun/);
-  assert.match(source, /EXPORT_CLASSIFY_BATCH/);
-  assert.match(source, /IMPORT_CLASSIFICATIONS/);
+  assert.match(source, /EXPORT_AI_CLASSIFY_BATCH/);
+  assert.match(source, /IMPORT_AI_CLASSIFICATIONS/);
   assert.match(source, /fetchWithTimeout/);
   assert.match(source, /repairLooseJson/);
   assert.match(source, /chatCompletionsUrl/);
@@ -824,10 +1304,14 @@ test("dashboard exposes AI API batch video classification controls", () => {
 test("automatic API classification uses alarms and preserves manual results", () => {
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
+  const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
   assert.equal(manifest.permissions.includes("alarms"), true);
   assert.equal(core.DEFAULT_SETTINGS.llmAutoClassifyMode, "off");
   assert.equal(core.DEFAULT_SETTINGS.llmAutoClassifyThreshold, 50);
   assert.match(background, /AUTO_LLM_ALARM/);
+  assert.match(background, /AUTO_LLM_REFRESH_TRIGGER/);
+  assert.match(background, /CHECK_AUTO_LLM/);
+  assert.match(background, /refresh-check-only-threshold/);
   assert.match(background, /periodInMinutes: 24 \* 60/);
   assert.match(background, /periodInMinutes: 7 \* 24 \* 60/);
   assert.match(background, /mode === "threshold"/);
@@ -835,9 +1319,11 @@ test("automatic API classification uses alarms and preserves manual results", ()
   assert.match(background, /exportClassifyBatch\(\{ includeAll: false/);
   assert.match(background, /importClassifications\(JSON\.stringify\(payload\)/);
   assert.match(background, /core\.isManualClassification\(classification\)/);
+  assert.match(dashboard, /checkAutoLlmOnRefresh/);
+  assert.match(dashboard, /CHECK_AUTO_LLM/);
 });
 
-test("fresh install onboarding detects login and exposes three first classification paths", () => {
+test("fresh install onboarding detects login and exposes the supported classification paths", () => {
   const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/dashboard.css", import.meta.url), "utf8");
@@ -851,17 +1337,15 @@ test("fresh install onboarding detects login and exposes three first classificat
   assert.match(dashboard, /正在检查 B站登录状态/);
   assert.match(dashboard, /我要手动设置我的分类/);
   assert.match(dashboard, /我有 API，让 AI 帮我调整分类/);
-  assert.match(dashboard, /我没有 API，手动复制 Prompt 来生成分类目录/);
+  assert.doesNotMatch(dashboard, /手动复制 Prompt|手动导入\/导出|onboarding-prompt-import/);
   assert.match(dashboard, /open-onboarding-api-settings/);
   assert.match(dashboard, /llm-base-url/);
-  assert.match(dashboard, /onboarding-prompt-import/);
   assert.match(dashboard, /EXPORT_CATEGORY_PROPOSAL/);
   assert.match(dashboard, /IMPORT_CATEGORIES/);
   assert.match(dashboard, /新的分类目录已生成/);
   assert.match(dashboard, /还需要手动调整吗/);
   assert.match(dashboard, /back-onboarding-setup/);
   assert.match(dashboard, /手动调整一个视频分类/);
-  assert.match(dashboard, /AI \(手动导入\/导出\) 批量视频分类/);
   assert.match(dashboard, /启动 AI \(API\) 批量视频分类/);
   assert.match(dashboard, /finishClassificationAndSync/);
   assert.match(css, /\.onboarding-overlay/);
@@ -878,7 +1362,8 @@ test("onboarding category-list updates do not classify videos before step three"
   assert.equal(importSource.includes("autoClassify("), false);
   assert.match(importSource, /appendKeywordCategories\(addedCategoryIds, categories\)/);
   assert.match(dashboard, /confirmAndImportCategories\(payload, "api", "API"\)/);
-  assert.match(dashboard, /confirmAndImportCategories\(parseJsonObject\(payload\), "prompt", "手动 Prompt"\)/);
+  assert.doesNotMatch(dashboard, /confirmAndImportCategories\([^\n]*prompt/);
+  assert.doesNotMatch(dashboard, /手动复制 Prompt|手动导入\/导出|onboarding-prompt-import/);
   assert.match(dashboard, /source,\s*skipAutoClassify: onboardingActive\(\)/);
   assert.match(background, /message\.skipAutoClassify[\s\S]*?暂不分类视频/);
   assert.match(dashboard, /SYNC_ON_OPEN, skipAutoClassify: onboardingActive\(\)/);
@@ -912,6 +1397,9 @@ test("LLM batch import refreshes state and reads latest video records", () => {
   const dashboard = readFileSync(new URL("../src/dashboard.js", import.meta.url), "utf8");
   const background = readFileSync(new URL("../src/background.js", import.meta.url), "utf8");
   assert.match(dashboard, /updateState\(importedState\)/);
+  assert.match(dashboard, /batchBvids: exported\.batchBvids/);
   assert.match(background, /await db\.get\("videos", item\.bvid\)/);
   assert.match(background, /await db\.getClassification\(item\.bvid\)/);
+  assert.match(background, /batchBvids: batch\.map\(\(video\) => video\.bvid\)/);
+  assert.match(background, /expectedBvids: Array\.isArray\(settings\.batchBvids\)/);
 });

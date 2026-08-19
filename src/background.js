@@ -6,8 +6,10 @@ const CLASSIFICATION_REPAIR_VERSION = "0.2.4";
 const ONBOARDING_VERSION = 1;
 const AUTO_LLM_ALARM = "auto-llm-classify";
 const AUTO_LLM_CONTINUE_ALARM = "auto-llm-classify-continue";
+const AUTO_LLM_REFRESH_TRIGGER = "refresh";
 const AUTO_LLM_MAX_BATCHES_PER_WAKE = 2;
 const MAX_BACKUP_RECORDS = 100000;
+const FAVORITE_TITLE_MAX_LENGTH = 50;
 const BACKUP_VIDEO_METADATA_FIELDS = Object.freeze([
   "oid",
   "aid",
@@ -21,6 +23,12 @@ const BACKUP_VIDEO_METADATA_FIELDS = Object.freeze([
   "desc",
   "duration",
   "viewCount",
+  "danmakuCount",
+  "likeCount",
+  "coinCount",
+  "favoriteCount",
+  "shareCount",
+  "replyCount",
   "watchProgress",
   "isWatched",
   "pubdate",
@@ -100,9 +108,9 @@ async function handleMessage(message) {
       return exportCategoryProposal(message);
     case core.MESSAGE_TYPES.IMPORT_CATEGORIES:
       return importCategories(message);
-    case core.MESSAGE_TYPES.EXPORT_CLASSIFY_BATCH:
+    case core.MESSAGE_TYPES.EXPORT_AI_CLASSIFY_BATCH:
       return exportClassifyBatch(message);
-    case core.MESSAGE_TYPES.IMPORT_CLASSIFICATIONS:
+    case core.MESSAGE_TYPES.IMPORT_AI_CLASSIFICATIONS:
       return importClassifications(message.payload, message.options || {});
     case core.MESSAGE_TYPES.AUTO_CLASSIFY:
       return autoClassify(message.options || {});
@@ -110,14 +118,18 @@ async function handleMessage(message) {
       return checkBiliLogin();
     case core.MESSAGE_TYPES.SYNC_ON_OPEN:
       return syncOnOpen(message);
-    case core.MESSAGE_TYPES.RESET_FOR_LLM_RECLASSIFY:
-      return resetForLlmReclassify();
+    case core.MESSAGE_TYPES.CHECK_AUTO_LLM:
+      return checkAutoLlmClassification(AUTO_LLM_REFRESH_TRIGGER);
     case core.MESSAGE_TYPES.SAVE_MANUAL_CLASSIFICATION:
       return saveManualClassification(message);
     case core.MESSAGE_TYPES.BULK_UPDATE_CLASSIFICATIONS:
       return bulkUpdateClassifications(message);
+    case core.MESSAGE_TYPES.CREATE_FAVORITE_FOLDER_AND_ADD:
+      return createFavoriteFolderAndAdd(message);
     case core.MESSAGE_TYPES.REMOVE_FROM_WATCHLATER:
       return removeFromWatchlater(message);
+    case core.MESSAGE_TYPES.BULK_REMOVE_FROM_WATCHLATER:
+      return bulkRemoveFromWatchlater(message);
     case core.MESSAGE_TYPES.UPDATE_SETTINGS:
       return updateSettings(message.settings || {});
     case core.MESSAGE_TYPES.OPEN_DASHBOARD:
@@ -180,6 +192,12 @@ function chromeStorageSet(values) {
   return chrome.storage.local.set(values);
 }
 
+function migrateOnboardingSettings(settings) {
+  if (!settings || typeof settings !== "object") return;
+  if (settings.onboardingStage === "setup-prompt") settings.onboardingStage = "setup-api";
+  if (settings.onboardingMethod === "prompt") settings.onboardingMethod = "api";
+}
+
 async function ensureConfig() {
   const data = await chromeStorageGet(["settings", "categories"]);
   const updates = {};
@@ -188,6 +206,14 @@ async function ensureConfig() {
   } else {
     updates.settings = Object.assign({}, core.DEFAULT_SETTINGS, data.settings);
   }
+  updates.settings.browseMode = core.normalizeBrowseMode(updates.settings.browseMode);
+  updates.settings.videoViewMode = core.normalizeVideoViewMode(updates.settings.videoViewMode);
+  updates.settings.collapsedCategoryIds = core.normalizeCollapsedCategoryIds(updates.settings.collapsedCategoryIds);
+  migrateOnboardingSettings(updates.settings);
+  updates.settings.categorySampleLimit = core.normalizeCategorySampleLimit(
+    updates.settings.categorySampleLimit,
+    core.DEFAULT_SETTINGS.categorySampleLimit
+  );
   if (!Array.isArray(data.categories) || !data.categories.length) {
     updates.categories = core.DEFAULT_CATEGORIES.map((category) => Object.assign({}, category));
   }
@@ -199,8 +225,16 @@ async function ensureConfig() {
 async function getConfig() {
   await ensureConfig();
   const data = await chromeStorageGet(["settings", "categories"]);
+  const settings = Object.assign({}, core.DEFAULT_SETTINGS, data.settings || {});
+  settings.browseMode = core.normalizeBrowseMode(settings.browseMode);
+  settings.videoViewMode = core.normalizeVideoViewMode(settings.videoViewMode);
+  settings.collapsedCategoryIds = core.normalizeCollapsedCategoryIds(settings.collapsedCategoryIds);
+  settings.categorySampleLimit = core.normalizeCategorySampleLimit(
+    settings.categorySampleLimit,
+    core.DEFAULT_SETTINGS.categorySampleLimit
+  );
   return {
-    settings: Object.assign({}, core.DEFAULT_SETTINGS, data.settings || {}),
+    settings,
     categories: Array.isArray(data.categories) && data.categories.length
       ? data.categories
       : core.DEFAULT_CATEGORIES.map((category) => Object.assign({}, category))
@@ -252,6 +286,15 @@ async function runClassificationRepair() {
 async function updateSettings(nextSettings) {
   const config = await getConfig();
   const settings = Object.assign({}, config.settings);
+  if ([core.BROWSE_MODES.CATEGORIES, core.BROWSE_MODES.UP].includes(nextSettings.browseMode)) {
+    settings.browseMode = nextSettings.browseMode;
+  }
+  if ([core.VIDEO_VIEW_MODES.CARDS, core.VIDEO_VIEW_MODES.LIST].includes(nextSettings.videoViewMode)) {
+    settings.videoViewMode = nextSettings.videoViewMode;
+  }
+  if (Array.isArray(nextSettings.collapsedCategoryIds)) {
+    settings.collapsedCategoryIds = core.normalizeCollapsedCategoryIds(nextSettings.collapsedCategoryIds);
+  }
   if (["watchlater", "pubdate", "duration"].includes(nextSettings.sortMode)) {
     settings.sortMode = nextSettings.sortMode;
   }
@@ -261,9 +304,6 @@ async function updateSettings(nextSettings) {
   if (Number.isFinite(Number(nextSettings.batchSize))) {
     settings.batchSize = Math.min(100, Math.max(20, Number(nextSettings.batchSize)));
   }
-  if (Number.isFinite(Number(nextSettings.manualExportLimit))) {
-    settings.manualExportLimit = Math.min(500, Math.max(0, Number(nextSettings.manualExportLimit)));
-  }
   if (Number.isFinite(Number(nextSettings.detailConcurrency))) {
     settings.detailConcurrency = Math.min(6, Math.max(1, Number(nextSettings.detailConcurrency)));
   }
@@ -272,6 +312,12 @@ async function updateSettings(nextSettings) {
   }
   if (Number.isFinite(Number(nextSettings.llmLimit))) {
     settings.llmLimit = Math.min(10000, Math.max(0, Number(nextSettings.llmLimit)));
+  }
+  if (Number.isFinite(Number(nextSettings.categorySampleLimit))) {
+    settings.categorySampleLimit = core.normalizeCategorySampleLimit(
+      nextSettings.categorySampleLimit,
+      settings.categorySampleLimit
+    );
   }
   if (Number.isFinite(Number(nextSettings.llmTemperature))) {
     settings.llmTemperature = Math.min(2, Math.max(0, Number(nextSettings.llmTemperature)));
@@ -300,10 +346,10 @@ async function updateSettings(nextSettings) {
   if (typeof nextSettings.onboardingCompleted === "boolean") {
     settings.onboardingCompleted = nextSettings.onboardingCompleted;
   }
-  if (["login", "setup", "setup-categories", "setup-api", "setup-prompt", "setup-result", "guide", "classify", "complete"].includes(nextSettings.onboardingStage)) {
+  if (["login", "setup", "setup-categories", "setup-api", "setup-result", "guide", "classify", "complete"].includes(nextSettings.onboardingStage)) {
     settings.onboardingStage = nextSettings.onboardingStage;
   }
-  if (["", "categories", "api", "prompt"].includes(nextSettings.onboardingMethod)) {
+  if (["", "categories", "api"].includes(nextSettings.onboardingMethod)) {
     settings.onboardingMethod = nextSettings.onboardingMethod;
   }
   if (Number.isFinite(Number(nextSettings.onboardingVersion))) {
@@ -345,11 +391,19 @@ async function maybeRunAutoLlmClassification(triggerName) {
   return autoLlmRunPromise;
 }
 
+async function checkAutoLlmClassification(triggerName) {
+  const result = await maybeRunAutoLlmClassification(triggerName);
+  return Object.assign(await getState(), { autoLlmResult: result });
+}
+
 async function runScheduledLlmClassification(triggerName) {
   const config = await getConfig();
   const settings = config.settings || {};
   const mode = settings.llmAutoClassifyMode || "off";
   if (mode === "off") return { skipped: true, reason: "disabled" };
+  if (triggerName === AUTO_LLM_REFRESH_TRIGGER && mode !== "threshold") {
+    return { skipped: true, reason: "refresh-check-only-threshold" };
+  }
   if (!apiConfigReady(settings)) {
     await writeAutoLlmStatus({
       llmAutoClassifyLastRunAt: Date.now(),
@@ -408,7 +462,10 @@ async function runAutomaticLlmBatches(settings) {
     if (!exported.batchSize) break;
     setProgress({ message: "正在自动分类第 " + (batches + 1) + " 批，共 " + exported.batchSize + " 个视频", pending: remaining, running: 1 });
     const payload = await callAutomaticLlm(settings, exported.prompt || "");
-    const importedState = await importClassifications(JSON.stringify(payload), { mergeMode: "replace" });
+    const importedState = await importClassifications(JSON.stringify(payload), {
+      mergeMode: "replace",
+      batchBvids: exported.batchBvids
+    });
     const importResult = importedState.importResult || {};
     imported += importResult.imported || 0;
     skipped += importResult.skipped || 0;
@@ -595,8 +652,13 @@ function normalizeDataBackup(payload) {
     throw new Error("数据备份中缺少分类目录");
   }
 
+  const normalizedSettings = normalizeBackupSettings(parsed.settings);
+  if (!parsed.settings || !Object.prototype.hasOwnProperty.call(parsed.settings, "collapsedCategoryIds")) {
+    normalizedSettings.collapsedCategoryIds = [];
+  }
+
   return {
-    settings: normalizeBackupSettings(parsed.settings),
+    settings: normalizedSettings,
     categories: normalizeImportedCategories({ categories: parsed.categories }, { allowSmall: true, ensureFallback: true }),
     videos: normalizeBackupArray(parsed.videos, "videos"),
     classifications: normalizeBackupArray(parsed.classifications, "classifications"),
@@ -625,15 +687,24 @@ function normalizeBackupSettings(settings) {
   const copyBoolean = (key) => {
     if (typeof settings[key] === "boolean") normalized[key] = settings[key];
   };
+  const copyPositiveInteger = (key) => {
+    if (!has(key)) return;
+    const value = Number(settings[key]);
+    if (!Number.isFinite(value) || value < 1) return;
+    normalized[key] = Math.floor(value);
+  };
 
   if (["watchlater", "pubdate", "duration"].includes(settings.sortMode)) normalized.sortMode = settings.sortMode;
   if (["asc", "desc"].includes(settings.sortDirection)) normalized.sortDirection = settings.sortDirection;
+  if ([core.BROWSE_MODES.CATEGORIES, core.BROWSE_MODES.UP].includes(settings.browseMode)) normalized.browseMode = settings.browseMode;
+  if ([core.VIDEO_VIEW_MODES.CARDS, core.VIDEO_VIEW_MODES.LIST].includes(settings.videoViewMode)) normalized.videoViewMode = settings.videoViewMode;
+  if (has("collapsedCategoryIds")) normalized.collapsedCategoryIds = core.normalizeCollapsedCategoryIds(settings.collapsedCategoryIds);
   copyNumber("batchSize", 20, 100, true);
-  copyNumber("manualExportLimit", 0, 500, true);
   copyNumber("detailConcurrency", 1, 6, true);
   copyNumber("llmBatchSize", 1, 100, true);
   copyNumber("llmLimit", 0, 10000, false);
   copyNumber("llmTemperature", 0, 2, false);
+  copyPositiveInteger("categorySampleLimit");
   copyNumber("llmAutoClassifyThreshold", 1, 10000, true);
   copyNumber("llmAutoClassifyLastRunAt", 0, Number.MAX_SAFE_INTEGER, false);
   copyNumber("llmAutoClassifyLastImported", 0, MAX_BACKUP_RECORDS, true);
@@ -645,8 +716,10 @@ function normalizeBackupSettings(settings) {
 
   if (typeof settings.llmApiFormat === "string") normalized.llmApiFormat = core.normalizeLlmApiFormat(settings.llmApiFormat);
   if (["off", "daily", "weekly", "threshold"].includes(settings.llmAutoClassifyMode)) normalized.llmAutoClassifyMode = settings.llmAutoClassifyMode;
-  if (["", "categories", "api", "prompt"].includes(settings.onboardingMethod)) normalized.onboardingMethod = settings.onboardingMethod;
-  if (["login", "setup", "setup-categories", "setup-api", "setup-prompt", "setup-result", "guide", "classify", "complete"].includes(settings.onboardingStage)) normalized.onboardingStage = settings.onboardingStage;
+  const onboardingMethod = settings.onboardingMethod === "prompt" ? "api" : settings.onboardingMethod;
+  const onboardingStage = settings.onboardingStage === "setup-prompt" ? "setup-api" : settings.onboardingStage;
+  if (["", "categories", "api"].includes(onboardingMethod)) normalized.onboardingMethod = onboardingMethod;
+  if (["login", "setup", "setup-categories", "setup-api", "setup-result", "guide", "classify", "complete"].includes(onboardingStage)) normalized.onboardingStage = onboardingStage;
   copyBoolean("onboardingEligible");
   copyBoolean("onboardingCompleted");
   copyString("llmBaseUrl", 2048);
@@ -950,7 +1023,8 @@ async function upsertVideoItems(items, options) {
   return Object.assign(await getState(), { scanResult });
 }
 
-async function queueMissingVideoDetails() {
+async function queueMissingVideoDetails(options) {
+  const settings = options || {};
   const config = await getConfig();
   if (!config.settings.detailFetchEnabled) {
     setProgress({ status: "idle", message: "详情更新已关闭", running: 0 });
@@ -960,17 +1034,20 @@ async function queueMissingVideoDetails() {
   }
 
   const videos = await db.getAll("videos");
+  const requestedBvids = new Set(Array.isArray(settings.bvids) ? core.uniqueStrings(settings.bvids) : []);
   const missingDetailBvids = videos
     .filter((video) => video && video.presentInWatchlater !== false)
+    .filter((video) => !requestedBvids.size || requestedBvids.has(video.bvid))
     .filter(shouldFetchDetails)
     .map((video) => video.bvid);
-  const queued = await db.queueJobs("detail", missingDetailBvids, "manual");
+  const queued = await db.queueJobs("detail", missingDetailBvids, settings.reason || "manual");
   const jobs = await db.getAll("jobs");
   const activeJobs = jobs.filter((job) => job.type === "detail" && (job.status === "pending" || job.status === "running"));
 
   if (activeJobs.length) {
     setProgress({ status: "running", message: "已排队 " + activeJobs.length + " 个视频详情", pending: activeJobs.length, running: 0, done: 0, failed: 0 });
     startDetailQueue();
+    if (settings.waitForCompletion && detailRunPromise) await detailRunPromise;
   } else {
     setProgress({ status: "idle", message: "没有缺失详情的视频", pending: 0, running: 0 });
   }
@@ -986,8 +1063,10 @@ async function queueMissingVideoDetails() {
 
 function shouldFetchDetails(video) {
   if (!video) return false;
-  if (video.viewCount == null) return true;
+  if (["viewCount", "danmakuCount", "likeCount", "coinCount", "favoriteCount", "shareCount", "replyCount"]
+    .some((field) => video[field] == null)) return true;
   if (!video.tname || !video.desc || !Array.isArray(video.tags) || !video.tags.length) return true;
+  if (!video.upName || !Array.isArray(video.pageParts) || !video.pageParts.length) return true;
   return false;
 }
 
@@ -1033,6 +1112,7 @@ function convertBiliApiVideo(item, index) {
   const bvid = core.normalizeBvid(item && (item.bvid || item.bv_id || item.uri || item.redirect_url));
   if (!bvid) return null;
   const owner = item.owner || item.author || {};
+  const stat = item.stat || {};
   const duration = Number(item.duration) || 0;
   const rawProgress = Number(item.progress);
   const hasProgress = Number.isFinite(rawProgress);
@@ -1048,7 +1128,13 @@ function convertBiliApiVideo(item, index) {
     tname: item.tname || item.typename || item.type_name,
     desc: item.desc,
     duration,
-    viewCount: item.stat && item.stat.view,
+    viewCount: stat.view,
+    danmakuCount: stat.danmaku,
+    likeCount: stat.like,
+    coinCount: stat.coin,
+    favoriteCount: stat.favorite,
+    shareCount: stat.share,
+    replyCount: stat.reply,
     watchProgress: hasProgress ? rawProgress : undefined,
     isWatched: hasProgress ? rawProgress < 0 || duration > 0 && rawProgress >= duration : undefined,
     pubdate: item.pubdate || item.pubtime || item.ctime,
@@ -1076,20 +1162,274 @@ async function removeFromWatchlater(message) {
   }
   if (!aid) throw new Error("缺少 aid，无法从稍后再看移除：" + bvid);
 
-  await requestWatchlaterRemove(aid, bvid);
+  await requestWatchlaterRemove(aid);
   await db.markRemoved(bvid);
   return Object.assign(await getState(), {
     removeResult: { bvid, aid }
   });
 }
 
-async function requestWatchlaterRemove(aid, bvid) {
+async function bulkRemoveFromWatchlater(message) {
+  const bvids = Array.from(new Set((Array.isArray(message && message.bvids) ? message.bvids : [])
+    .map((bvid) => core.normalizeBvid(bvid))
+    .filter(Boolean)));
+  if (!bvids.length) throw new Error("没有选择视频");
+
+  const removedBvids = [];
+  const failedItems = [];
+  for (const bvid of bvids) {
+    try {
+      let video = await db.get("videos", bvid);
+      if (!video) throw new Error("本地记录中没有这个视频：" + bvid);
+
+      let aid = normalizePositiveAid(video);
+      if (!aid) {
+        const details = await fetchVideoDetails(bvid);
+        const upsert = await db.upsertVideos([Object.assign({}, details, { bvid, presentInWatchlater: true })]);
+        video = upsert.results[0] ? upsert.results[0].video : Object.assign({}, video, details);
+        aid = normalizePositiveAid(video);
+      }
+      if (!aid) throw new Error("缺少 aid，无法从稍后再看移除：" + bvid);
+
+      await requestWatchlaterRemove(aid);
+      await db.markRemoved(bvid);
+      removedBvids.push(bvid);
+    } catch (error) {
+      failedItems.push({ bvid, reason: errorMessage(error) });
+    }
+  }
+
+  return Object.assign(await getState(), {
+    bulkRemoveResult: {
+      removedBvids,
+      removed: removedBvids.length,
+      successCount: removedBvids.length,
+      failed: failedItems.length,
+      failureCount: failedItems.length,
+      failedItems
+    }
+  });
+}
+
+async function createFavoriteFolderAndAdd(message) {
+  const title = core.truncateText(core.normalizeText(message && message.title), FAVORITE_TITLE_MAX_LENGTH);
+  if (!title) throw new Error("收藏夹名称不能为空");
+
+  const bvids = Array.from(new Set(core.uniqueStrings(message && message.bvids)
+    .map((bvid) => core.normalizeBvid(bvid))
+    .filter(Boolean)));
+  if (!bvids.length) throw new Error("请先选择视频");
+
+  const csrf = await getBiliCsrf();
+  const folder = await requestFavoriteFolderCreate(title, csrf);
+  const skipped = [];
+  const failed = [];
+  const candidates = [];
+  const seenAids = new Set();
+
+  for (const bvid of bvids) {
+    let video = await db.get("videos", bvid);
+    if (!video) {
+      failed.push({ bvid, reason: "本地记录不存在" });
+      continue;
+    }
+
+    let aid = normalizePositiveAid(video);
+    if (!aid) {
+      try {
+        const details = await fetchVideoDetails(bvid);
+        const upsert = await db.upsertVideos([Object.assign({}, details, { bvid, presentInWatchlater: true })]);
+        video = upsert.results[0] ? upsert.results[0].video : Object.assign({}, video, details);
+        aid = normalizePositiveAid(video);
+      } catch (error) {
+        failed.push({ bvid, reason: "视频详情补充失败：" + errorMessage(error) });
+        continue;
+      }
+    }
+
+    if (!aid) {
+      skipped.push({ bvid, reason: "缺少 aid" });
+      continue;
+    }
+    if (seenAids.has(aid)) {
+      skipped.push({ bvid, reason: "重复视频" });
+      continue;
+    }
+    seenAids.add(aid);
+    candidates.push({ bvid, aid });
+  }
+
+  const added = [];
+  for (const item of candidates) {
+    try {
+      await requestFavoriteResourceDeal(folder.id, item.aid, csrf);
+      added.push({ bvid: item.bvid, aid: item.aid });
+    } catch (error) {
+      const reason = errorMessage(error);
+      const target = isFavoriteAlreadyError(error) ? skipped : failed;
+      target.push({ bvid: item.bvid, reason });
+    }
+  }
+
+  const favoriteResult = {
+    folder: { id: folder.id, title: folder.title, privacy: 1 },
+    requested: bvids.length,
+    eligible: candidates.length,
+    added: added.length,
+    skipped: skipped.length,
+    failed: failed.length,
+    skippedItems: skipped,
+    failedItems: failed
+  };
+  return Object.assign(await getState(), { favoriteResult });
+}
+
+function normalizePositiveAid(video) {
+  const aid = Number(video && video.aid);
+  if (Number.isSafeInteger(aid) && aid > 0) return aid;
+  const oid = Number(video && video.oid);
+  return Number.isSafeInteger(oid) && oid > 0 ? oid : 0;
+}
+
+function errorMessage(error) {
+  return error && error.message ? error.message : String(error);
+}
+
+async function requestFavoriteFolderCreate(title, csrf) {
+  const json = await requestBiliFormWithPageFallback(
+    "https://api.bilibili.com/x/v3/fav/folder/add",
+    { title, intro: "", privacy: "1", csrf },
+    "B站创建收藏夹"
+  );
+  const id = Number(json && json.data && (json.data.id || json.data.media_id));
+  if (!Number.isSafeInteger(id) || id <= 0) throw new Error("B站创建收藏夹未返回有效 ID");
+  return {
+    id,
+    title: core.normalizeText(json.data.title) || title
+  };
+}
+
+async function requestFavoriteResourceDeal(mediaId, aid, csrf) {
+  await requestBiliFormWithPageFallback(
+    "https://api.bilibili.com/x/v3/fav/resource/deal",
+    {
+      rid: String(aid),
+      type: "2",
+      add_media_ids: String(mediaId),
+      del_media_ids: "",
+      csrf
+    },
+    "B站批量加入收藏夹"
+  );
+}
+
+async function requestBiliFormWithPageFallback(url, fields, label) {
+  try {
+    return await postBiliForm(url, fields, label);
+  } catch (error) {
+    if (!shouldRetryBiliPageRequest(error)) throw error;
+    return requestBiliFormFromPage(url, fields, label);
+  }
+}
+
+async function postBiliForm(url, fields, label) {
+  const body = new URLSearchParams();
+  Object.entries(fields || {}).forEach(([key, value]) => body.set(key, String(value == null ? "" : value)));
+  const response = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    referrer: "https://www.bilibili.com/",
+    referrerPolicy: "strict-origin-when-cross-origin",
+    headers: {
+      "accept": "application/json,text/plain,*/*",
+      "content-type": "application/x-www-form-urlencoded;charset=UTF-8"
+    },
+    body: body.toString()
+  });
+  if (!response.ok) throw new Error(label + " HTTP " + response.status);
+  return assertBiliSuccess(await response.json(), label);
+}
+
+async function requestBiliFormFromPage(url, fields, label) {
+  let tab = await findBiliPageTab();
+  let createdTab = false;
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: "https://www.bilibili.com/", active: false });
+    createdTab = true;
+  }
+
+  try {
+    if (!tab || tab.id == null) throw new Error("无法打开 B站页面执行收藏操作");
+    await waitForTabComplete(tab.id);
+    await delay(createdTab ? 500 : 120);
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      world: "MAIN",
+      args: [{ url, fields, label }],
+      func: async (request) => {
+        const body = new URLSearchParams();
+        Object.entries(request.fields || {}).forEach(([key, value]) => body.set(key, String(value == null ? "" : value)));
+        const response = await fetch(request.url, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "accept": "application/json,text/plain,*/*",
+            "content-type": "application/x-www-form-urlencoded;charset=UTF-8"
+          },
+          body: body.toString()
+        });
+        if (!response.ok) throw new Error(request.label + "页面接口 HTTP " + response.status);
+        const json = await response.json();
+        if (!json || json.code !== 0) {
+          const error = new Error(request.label + "失败：" + (json && json.message ? json.message : "code " + (json && json.code)));
+          error.biliCode = Number(json && json.code);
+          throw error;
+        }
+        return json;
+      }
+    });
+    if (!results || !results[0] || !results[0].result) {
+      throw new Error(label + "页面请求没有返回成功结果");
+    }
+    return results[0].result;
+  } finally {
+    if (createdTab && tab && tab.id != null) chrome.tabs.remove(tab.id).catch(() => {});
+  }
+}
+
+function assertBiliSuccess(json, label) {
+  if (!json || json.code !== 0) {
+    const error = new Error(label + "失败：" + (json && json.message ? json.message : "code " + (json && json.code)));
+    error.biliCode = Number(json && json.code);
+    throw error;
+  }
+  return json;
+}
+
+function shouldRetryBiliPageRequest(error) {
+  return /HTTP 412|Failed to fetch|Referrer|referrer|CORS|TypeError/i.test(errorMessage(error));
+}
+
+function isFavoriteAlreadyError(error) {
+  return /已收藏|已经收藏|已在收藏夹|already\s*(?:be\s*)?favorit|duplicate/i.test(errorMessage(error));
+}
+
+async function findBiliPageTab() {
+  const tabs = await chrome.tabs.query({ url: "https://www.bilibili.com/*" });
+  return tabs && tabs.length ? tabs[0] : null;
+}
+
+async function requestWatchlaterRemove(aid) {
   const csrf = await getBiliCsrf();
   try {
     await postWatchlaterRemove(aid, csrf);
   } catch (error) {
-    if (!shouldRetryRemoveFromPage(error)) throw error;
-    await requestWatchlaterRemoveFromPage(aid, csrf, bvid);
+    if (!shouldRetryBiliPageRequest(error)) throw error;
+    await requestBiliFormFromPage(
+      "https://api.bilibili.com/x/v2/history/toview/del",
+      { aid, csrf },
+      "B站移出稍后再看"
+    );
   }
 }
 
@@ -1115,63 +1455,6 @@ async function postWatchlaterRemove(aid, csrf) {
   if (!json || json.code !== 0) {
     throw new Error("B站删除失败：" + (json && json.message ? json.message : "code " + (json && json.code)));
   }
-}
-
-function shouldRetryRemoveFromPage(error) {
-  const text = error && error.message ? error.message : String(error);
-  return /B站删除|HTTP 412|Failed to fetch|Referrer|referrer|CORS|TypeError/i.test(text);
-}
-
-async function requestWatchlaterRemoveFromPage(aid, csrf, bvid) {
-  let tab = await findWatchlaterTab();
-  let createdTab = false;
-  if (!tab) {
-    tab = await chrome.tabs.create({ url: "https://www.bilibili.com/watchlater/list#/list", active: false });
-    createdTab = true;
-  }
-
-  try {
-    if (!tab || tab.id == null) throw new Error("无法打开 B站稍后再看页面");
-    await waitForTabComplete(tab.id);
-    await delay(createdTab ? 500 : 120);
-    const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: "MAIN",
-      args: [{ aid, csrf, bvid }],
-      func: async (request) => {
-        const body = new URLSearchParams();
-        body.set("aid", String(request.aid));
-        body.set("csrf", request.csrf);
-        const response = await fetch("https://api.bilibili.com/x/v2/history/toview/del", {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "accept": "application/json,text/plain,*/*",
-            "content-type": "application/x-www-form-urlencoded;charset=UTF-8"
-          },
-          body: body.toString()
-        });
-        if (!response.ok) throw new Error("B站页面删除接口 HTTP " + response.status);
-        const json = await response.json();
-        if (!json || json.code !== 0) {
-          throw new Error("B站页面删除失败：" + (json && json.message ? json.message : "code " + (json && json.code)));
-        }
-        return { aid: request.aid, bvid: request.bvid, code: json.code };
-      }
-    });
-    if (!results || !results[0] || !results[0].result || results[0].result.code !== 0) {
-      throw new Error("B站页面删除请求没有返回成功结果");
-    }
-  } finally {
-    if (createdTab && tab && tab.id) {
-      chrome.tabs.remove(tab.id).catch(() => {});
-    }
-  }
-}
-
-async function findWatchlaterTab() {
-  const tabs = await chrome.tabs.query({ url: "https://www.bilibili.com/watchlater/list*" });
-  return tabs && tabs.length ? tabs[0] : null;
 }
 
 function waitForTabComplete(tabId) {
@@ -1273,6 +1556,7 @@ async function fetchVideoDetails(bvid) {
 
   const data = view.data;
   const owner = data.owner || {};
+  const stat = data.stat || {};
   return {
     bvid: data.bvid || bvid,
     oid: data.aid,
@@ -1286,7 +1570,13 @@ async function fetchVideoDetails(bvid) {
     tags,
     desc: data.desc,
     duration: data.duration,
-    viewCount: data.stat && data.stat.view,
+    viewCount: stat.view,
+    danmakuCount: stat.danmaku,
+    likeCount: stat.like,
+    coinCount: stat.coin,
+    favoriteCount: stat.favorite,
+    shareCount: stat.share,
+    replyCount: stat.reply,
     pubdate: data.pubdate || data.ctime,
     pageParts: Array.isArray(data.pages) ? data.pages.map((page) => page.part).filter(Boolean) : [],
     presentInWatchlater: true
@@ -1321,6 +1611,7 @@ async function fetchVideoDetailsFromHtml(bvid) {
     }
   }
   const videoData = parsed && (parsed.videoData || parsed.videoInfo || {});
+  const stat = (videoData && videoData.stat) || {};
   const aid = videoData && videoData.aid || parsed && parsed.aid;
   return {
     bvid,
@@ -1332,7 +1623,13 @@ async function fetchVideoDetailsFromHtml(bvid) {
     tname: videoData && videoData.tname,
     coverUrl: videoData && videoData.pic,
     duration: videoData && videoData.duration,
-    viewCount: videoData && videoData.stat && videoData.stat.view,
+    viewCount: stat.view,
+    danmakuCount: stat.danmaku,
+    likeCount: stat.like,
+    coinCount: stat.coin,
+    favoriteCount: stat.favorite,
+    shareCount: stat.share,
+    replyCount: stat.reply,
     pubdate: videoData && (videoData.pubdate || videoData.ctime),
     presentInWatchlater: true
   };
@@ -1358,7 +1655,10 @@ async function exportCategoryProposal(message) {
   const summary = await db.summary();
   const candidates = shuffledCopy(summary.videos
     .filter((video) => video && video.presentInWatchlater !== false));
-  const requested = Math.min(100, Math.max(10, Number(message.limit) || 60));
+  const requested = core.normalizeCategorySampleLimit(
+    config.settings.categorySampleLimit,
+    core.DEFAULT_SETTINGS.categorySampleLimit
+  );
   const sample = candidates.slice(0, requested);
   return {
     prompt: core.buildCategoryProposalPrompt(sample, config.categories, { sampleLimit: requested }),
@@ -1509,13 +1809,9 @@ function normalizeImportedCategories(payload, options) {
   return categories;
 }
 
-async function exportClassifyBatch(message) {
-  const config = await getConfig();
-  const summary = await db.summary();
+function selectClassificationCandidates(summary, includeAll) {
   const classificationByBvid = new Map(summary.classifications.map((item) => [item.bvid, item]));
-  const includeAll = Boolean(message.includeAll);
-  const offset = Math.max(0, Number(message.offset || 0));
-  let candidates = summary.videos
+  return summary.videos
     .filter((video) => video.presentInWatchlater !== false)
     .filter((video) => {
       const classification = classificationByBvid.get(video.bvid);
@@ -1523,9 +1819,33 @@ async function exportClassifyBatch(message) {
       return includeAll || core.needsLlmExport(video, classification);
     })
     .sort((a, b) => (b.lastSeenAt || 0) - (a.lastSeenAt || 0));
+}
+
+async function exportClassifyBatch(message) {
+  const initialConfig = await getConfig();
+  const initialSummary = await db.summary();
+  const includeAll = Boolean(message.includeAll);
+  const offset = Math.max(0, Number(message.offset || 0));
+  let candidates = selectClassificationCandidates(initialSummary, includeAll);
   if (message.randomize) candidates = shuffledCopy(candidates);
-  const limit = exportLimit(message.limit, config.settings.manualExportLimit || config.settings.batchSize, candidates.length);
-  const batch = candidates.slice(offset, offset + limit);
+  const limit = exportLimit(message.limit, initialConfig.settings.batchSize, candidates.length);
+  const initialBatch = candidates.slice(offset, offset + limit);
+  const initialBatchBvids = initialBatch.map((video) => video.bvid);
+  const missingDetailBvids = initialBatch.filter(shouldFetchDetails).map((video) => video.bvid);
+  if (missingDetailBvids.length) {
+    await queueMissingVideoDetails({
+      bvids: missingDetailBvids,
+      waitForCompletion: true,
+      reason: "AI 分类"
+    });
+  }
+
+  const config = missingDetailBvids.length ? await getConfig() : initialConfig;
+  const summary = missingDetailBvids.length ? await db.summary() : initialSummary;
+  const latestByBvid = new Map(summary.videos.map((video) => [video.bvid, video]));
+  const batch = initialBatchBvids
+    .map((bvid) => latestByBvid.get(bvid))
+    .filter((video) => video && video.presentInWatchlater !== false);
   return {
     prompt: core.buildClassificationPrompt(batch, config.categories, Object.assign({}, config.settings, {
       keywordReview: !includeAll,
@@ -1533,6 +1853,7 @@ async function exportClassifyBatch(message) {
       compact: Boolean(message.compact)
     })),
     batchVideos: batch,
+    batchBvids: batch.map((video) => video.bvid),
     countRemaining: Math.max(0, candidates.length - offset),
     totalCandidates: candidates.length,
     offset,
@@ -1557,51 +1878,14 @@ function exportLimit(rawLimit, defaultLimit, total) {
   return Math.min(100, Math.max(1, number));
 }
 
-async function resetForLlmReclassify() {
-  const summary = await db.summary();
-  let removedClassifications = 0;
-  let keptManual = 0;
-
-  for (const classification of summary.classifications) {
-    if (core.isManualClassification(classification)) {
-      keptManual += 1;
-      if (classification.sourceType !== core.CLASSIFICATION_SOURCE_TYPES.MANUAL || !classification.manualOverride) {
-        await db.putClassification(Object.assign({}, classification, {
-          sourceType: core.CLASSIFICATION_SOURCE_TYPES.MANUAL,
-          manualOverride: true
-        }));
-      }
-      continue;
-    }
-    await db.remove("classifications", classification.bvid);
-    removedClassifications += 1;
-  }
-
-  await db.clear("jobs");
-  setProgress({
-    status: "idle",
-    message: "已重置 AI 全局视频分类：清除非手动确认结果 " + removedClassifications + " 项，保留手动确认 " + keptManual + " 项",
-    pending: 0,
-    running: 0,
-    done: 0,
-    failed: 0,
-    updatedAt: Date.now()
-  });
-
-  return Object.assign(await getState(), {
-    resetResult: {
-      removedClassifications,
-      keptManual,
-      clearedJobs: (summary.jobs || []).length
-    }
-  });
-}
-
 async function importClassifications(payload, options) {
+  const settings = options || {};
   const config = await getConfig();
   const summary = await db.summary();
   const parsed = core.parseClassificationPayload(payload);
-  const validated = core.validateClassificationItems(parsed.items, config.categories, summary.videos);
+  const validated = core.validateClassificationItems(parsed.items, config.categories, summary.videos, {
+    expectedBvids: Array.isArray(settings.batchBvids) ? settings.batchBvids : []
+  });
   const videosByBvid = new Map(summary.videos.map((video) => [video.bvid, video]));
   let imported = 0;
   let skipped = 0;
@@ -1618,7 +1902,7 @@ async function importClassifications(payload, options) {
       manualOverride: false,
       sourceType: core.CLASSIFICATION_SOURCE_TYPES.LLM
     });
-    if (options.mergeMode === "append" && existing && !core.isManualClassification(existing)) {
+    if (settings.mergeMode === "append" && existing && !core.isManualClassification(existing)) {
       incoming.categoryIds = core.uniqueStrings([...(existing.categoryIds || []), ...(item.categoryIds || [])]);
     }
     const merged = core.mergeClassification(existing, incoming, video);
